@@ -161,12 +161,17 @@ class IC10Compiler {
 				if (node.kind === 'const') {
 					if (!d.init)
 						throw new Error(`const ${name} must have an initializer`);
-					if (d.init.type === 'Literal') {
-						const num = this.convertJsValueToNumber(d.init.value, `const ${name}`);
+					try {
+						// evaluate the initializer at compile time
+						// use a fresh seen-set seeded with this constant name to detect cycles
+						const seen = new Set([name]);
+						const num = this.evaluateConstExpression(d.init, seen);
+						// store and emit define
 						this.consts.set(name, num);
 						this.preamble.push(`define ${name} ${num}`);
-					} else {
-						throw new Error(`const ${name} must be initialized with a literal`);
+					} catch (e) {
+						// propagate a clearer error mentioning the const name
+						throw new Error(`const ${name} initializer error: ${e.message}`);
 					}
 				} else {
 					const dest = this.allocVar(name);
@@ -778,6 +783,99 @@ class IC10Compiler {
 			return n;
 		}
 		throw new Error(`Unsupported literal type for IC10 conversion: ${t} (node: ${nodeHint || ''})`);
+	}
+
+	// Evaluate an expression AST node at compile-time for const initialization.
+	// Returns a numeric value or throws on unsupported/invalid usage.
+	evaluateConstExpression(node, seen = new Set()) {
+		if (!node)
+			throw new Error('Empty const initializer');
+
+		// prevent recursive cycles
+		if (node.type === 'Identifier') {
+			if (seen.has(node.name))
+				throw new Error(`Circular const reference to ${node.name}`);
+		}
+
+		switch (node.type) {
+		case 'Literal':
+			// reuse existing conversion logic (handles booleans/null/strings -> numbers)
+			return this.convertJsValueToNumber(node.value, 'const-eval-literal');
+
+		case 'Identifier': {
+				const name = node.name;
+				if (!this.consts.has(name))
+					throw new Error(`Const ${name} used before its declaration`);
+				return this.consts.get(name);
+			}
+
+		case 'UnaryExpression': {
+				const op = node.operator;
+				// mark to detect cycles if any Identifier inside
+				// evaluate arg
+				const argVal = this.evaluateConstExpression(node.argument, seen);
+				switch (op) {
+				case '+':
+					return +argVal;
+				case '-':
+					return -argVal;
+				case '!':
+					return (argVal === 0 ? 1 : 0);
+				default:
+					throw new Error(`Unsupported unary operator in const initializer: ${op}`);
+				}
+			}
+
+		case 'BinaryExpression': {
+				const op = node.operator;
+				// evaluate operands (passing same seen set)
+				const left = this.evaluateConstExpression(node.left, seen);
+				const right = this.evaluateConstExpression(node.right, seen);
+
+				switch (op) {
+				case '+':
+					return left + right;
+				case '-':
+					return left - right;
+				case '*':
+					return left * right;
+				case '/':
+					if (right === 0)
+						throw new Error('Division by zero in const initializer');
+					return left / right;
+				case '%':
+					if (right === 0)
+						throw new Error('Modulo by zero in const initializer');
+					return left % right;
+				case '**':
+					return Math.pow(left, right);
+					// comparisons return 1/0 to be consistent with numeric boolean handling
+				case '==':
+				case '===':
+					return left === right ? 1 : 0;
+				case '!=':
+				case '!==':
+					return left !== right ? 1 : 0;
+				case '<':
+					return left < right ? 1 : 0;
+				case '<=':
+					return left <= right ? 1 : 0;
+				case '>':
+					return left > right ? 1 : 0;
+				case '>=':
+					return left >= right ? 1 : 0;
+				default:
+					throw new Error(`Unsupported binary operator in const initializer: ${op}`);
+				}
+			}
+
+		case 'ParenthesizedExpression':
+			// some parsers include this; evaluate inner
+			return this.evaluateConstExpression(node.expression, seen);
+
+		default:
+			throw new Error(`Unsupported expression in const initializer: ${node.type}`);
+		}
 	}
 
 	mapBinaryOp(op) {
