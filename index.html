@@ -68,104 +68,116 @@ while (a < 5) {
   <script src="ic10compiler.js"></script>
   
   <script>
-  //Utils
-  function copyTextToClipboard(text) {
-    navigator.clipboard.writeText(text).then(function() {
-	  console.log('Async: Copying to clipboard was successful!');
-    }, function(err) {
-  	  console.error('Async: Could not copy text: ', err);
-    });
-  }
- 
-  function download(filename, text) {
-    var element = document.createElement('a');
-    element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
-    element.setAttribute('download', filename);
+	//Utils
+	function copyTextToClipboard(text) {
+		navigator.clipboard.writeText(text).then(function () {
+			console.log('Async: Copying to clipboard was successful!');
+		}, function (err) {
+			console.error('Async: Could not copy text: ', err);
+		});
+	}
 
-    element.style.display = 'none';
-    document.body.appendChild(element);
+	function download(filename, text) {
+		var element = document.createElement('a');
+		element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+		element.setAttribute('download', filename);
 
-    element.click();
+		element.style.display = 'none';
+		document.body.appendChild(element);
 
-    document.body.removeChild(element);
-  }
+		element.click();
 
-  // turn the existing textarea into a CodeMirror editor
-  const editor = CodeMirror.fromTextArea(document.getElementById('src'), {
-    mode: 'javascript',
-    lineNumbers: true,
-    tabSize: 2,
-    indentWithTabs: false
-  });
+		document.body.removeChild(element);
+	}
 
-  // ---- UI wiring ----
-  let compileError = false;
-  const out = document.getElementById('out');
-  document.getElementById('compile').addEventListener('click', () => {
-    //const src = document.getElementById('src').value;
-	const src = editor.getValue();
-	compileError = false;
-    let ast;
-    try {
-      ast = esprima.parseScript(src);
-	  console.log(ast);
-    } catch (e) {
-      out.textContent = 'Parse error: ' + e.message;
-	  compileError = true;
-      return;
-    }
-    try {
-      const c = new IC10Compiler();
+	// turn the existing textarea into a CodeMirror editor
+	const editor = CodeMirror.fromTextArea(document.getElementById('src'), {
+			mode: 'javascript',
+			lineNumbers: true,
+			tabSize: 2,
+			indentWithTabs: false
+		});
 
-	  const jsIC10CallHandlers = new JsIC10CallHandlers();
-	  jsIC10CallHandlers.Register(c);
-	  const jsMathCallHandlers = new JsMathCallHandlers();
-	  jsMathCallHandlers.Register(c);
+	// ---- UI wiring ----
+	let compileError = false;
+	const out = document.getElementById('out');
+	document.getElementById('compile').addEventListener('click', () => {
+		//const src = document.getElementById('src').value;
+		const src = editor.getValue();
+		compileError = false;
+		let ast;
+		try {
+			ast = esprima.parseScript(src);
+			console.log(ast);
+		} catch (e) {
+			out.textContent = 'Parse error: ' + e.message;
+			compileError = true;
+			return;
+		}
+		try {
+			const c = new IC10Compiler();
 
-      const ic = c.compileProgram(ast);
-      out.textContent = ic;
-    } catch (e) {
-      out.textContent = 'Compile error: ' + e.message;
-	  compileError = true;
-    }
-  });
-  document.getElementById('clear').addEventListener('click', () => out.textContent = '');
-  document.getElementById('copy').addEventListener('click', () => {
-	if (compileError) {return;}
-	copyTextToClipboard(out.textContent);
-  });
-  document.getElementById('save_proj').addEventListener('click', () => {
-	const src = editor.getValue();
-	const projObj = {source: src};
-	download('project.json', JSON.stringify(projObj));
-  });
-  document.getElementById('load_proj').addEventListener('click', () => {
-	document.getElementById('inp').click();
-	//hack
-	document.getElementById('inp').onclick = function () {
-	  this.value = null;
-	};
-  });
-  function readFile(e) {
-    var file = e.target.files[0];
-    if (!file) return;
-    var reader = new FileReader();
-    reader.onload = function(e) {
-	  const src = e.target.result;
-	  const projObj = JSON.parse(src);
-	  editor.setValue(projObj.source);
-    }
-    reader.readAsText(file)
-  }
-  document.getElementById('open_sim').addEventListener('click', () => {
-	if (compileError) {return;}
-	const payloadObj = {"program":"","registers":{"io":[{},{},{},{},{},{},{}],"ioConnected":[true,true,true,true,true,true,true],"internal":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ioSlot":[{},{},{},{},{},{},{}],"ioReagent":[{},{},{},{},{},{},{}]},"runAfterRegisterChange":false,"runWithErrors":false};
-	payloadObj.program = out.textContent;
-	const payload = JSON.stringify(payloadObj);
-	const urlParam = window.btoa(payload);
-	const baseUrl = "https://stationeering.com/tools/ic#";
-	window.open(baseUrl + urlParam, '_blank').focus();
-  });
+			const jsIC10CallHandlers = new JsIC10CallHandlers();
+			jsIC10CallHandlers.Register(c);
+			const jsMathCallHandlers = new JsMathCallHandlers();
+			jsMathCallHandlers.Register(c);
+
+			const ic = c.compileProgram(ast);
+			out.textContent = ic;
+		} catch (e) {
+			out.textContent = 'Compile error: ' + e.message;
+			compileError = true;
+		}
+	});
+	document.getElementById('clear').addEventListener('click', () => out.textContent = '');
+	document.getElementById('copy').addEventListener('click', () => {
+		if (compileError) {
+			return;
+		}
+		copyTextToClipboard(out.textContent);
+	});
+	document.getElementById('save_proj').addEventListener('click', () => {
+		const src = editor.getValue();
+		const projObj = {
+			source: src
+		};
+		download('project.json', JSON.stringify(projObj));
+	});
+	document.getElementById('load_proj').addEventListener('click', () => {
+		document.getElementById('inp').click();
+		//hack
+		document.getElementById('inp').onclick = function () {
+			this.value = null;
+		};
+	});
+	function readFile(e) {
+		var file = e.target.files[0];
+		if (!file)
+			return;
+		var reader = new FileReader();
+		reader.onload = function (e) {
+			const src = e.target.result;
+			const projObj = JSON.parse(src);
+			editor.setValue(projObj.source);
+		}
+		reader.readAsText(file)
+	}
+	document.getElementById('open_sim').addEventListener('click', () => {
+		if (compileError) {
+			return;
+		}
+		const payloadObj = {
+			"program": "",
+			"registers": {"io": [{}, {}, {}, {}, {}, {}, {}],"ioConnected": [true, true, true, true, true, true, true],"internal": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],"ioSlot": [{}, {}, {}, {}, {}, {}, {}],"ioReagent": [{}, {}, {}, {}, {}, {}, {}]},
+			"runAfterRegisterChange": false,
+			"runWithErrors": false
+		};
+		payloadObj.program = out.textContent;
+		const payload = JSON.stringify(payloadObj);
+		const urlParam = window.btoa(payload);
+		const baseUrl = "https://stationeering.com/tools/ic#";
+		window.open(baseUrl + urlParam, '_blank').focus();
+	});
   </script>
 </body>
 </html>
