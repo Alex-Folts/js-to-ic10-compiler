@@ -619,6 +619,110 @@ class IC10Compiler {
 				return dest;
 			}
 
+		case 'UnaryExpression': {
+				const op = node.operator;
+				const arg = node.argument;
+
+				// Helper to compile an argument into either:
+				//  - a JS number (immediate), OR
+				//  - a symbol string (const name), OR
+				//  - a register name like 'r8'
+				const compileArg = (n) => {
+					if (n.type === 'Literal') {
+						return this.convertJsValueToNumber(n.value, 'unary-literal');
+					}
+					if (n.type === 'Identifier') {
+						const nm = n.name;
+						if (this.consts.has(nm))
+							return nm; // symbol immediate
+						if (this.varReg.has(nm))
+							return this.varReg.get(nm);
+						// not declared yet — allocate var reg (fallback)
+						return this.allocVar(nm);
+					}
+					// member expression or complex -> compile to reg (may return temp)
+					return this.compileExpressionToReg(n);
+				};
+
+				if (op === '+') {
+					// numeric conversion: basically return the compiled arg as-is (fold literals)
+					const a = compileArg(arg);
+					if (typeof a === 'number') {
+						const t = this.newTemp();
+						this.emit(`move ${t} ${a}`);
+						return t;
+					}
+					return a;
+				}
+
+				if (op === '-') {
+					const a = compileArg(arg);
+
+					// immediate number -> fold
+					if (typeof a === 'number') {
+						const t = this.newTemp();
+						this.emit(`move ${t} ${-a}`);
+						return t;
+					}
+
+					// symbol const -> fold to immediate negative
+					if (typeof a === 'string' && !/^r\d+$/.test(a) && this.consts.has(a)) {
+						const val = -this.consts.get(a);
+						const t = this.newTemp();
+						this.emit(`move ${t} ${val}`);
+						return t;
+					}
+
+					// a is a register (rN) or temp -> dest = 0 - a
+					const aIsTemp = this.isTempReg(a);
+					let dest;
+					if (aIsTemp) {
+						dest = a; // reuse temp
+					} else {
+						dest = this.newTemp();
+					}
+					this.emit(`sub ${dest} 0 ${a}`);
+					// free original temp if it wasn't reused
+					if (!aIsTemp && this.isTempReg(a))
+						this.freeTemp(a);
+					return dest;
+				}
+
+				if (op === '!') {
+					const a = compileArg(arg);
+
+					// immediate number -> fold (!0 => 1, else 0)
+					if (typeof a === 'number') {
+						const t = this.newTemp();
+						this.emit(`move ${t} ${a === 0 ? 1 : 0}`);
+						return t;
+					}
+
+					// const symbol with numeric value -> fold
+					if (typeof a === 'string' && !/^r\d+$/.test(a) && this.consts.has(a)) {
+						const tv = this.consts.get(a) === 0 ? 1 : 0;
+						const t = this.newTemp();
+						this.emit(`move ${t} ${tv}`);
+						return t;
+					}
+
+					// otherwise produce seq dest a 0  (dest = (a == 0) ? 1 : 0)
+					const aIsTemp = this.isTempReg(a);
+					let dest;
+					if (aIsTemp)
+						dest = a;
+					else
+						dest = this.newTemp();
+					this.emit(`seq ${dest} ${a} 0`);
+					if (!aIsTemp && this.isTempReg(a))
+						this.freeTemp(a);
+					return dest;
+				}
+
+				// unsupported unary operator
+				throw new Error('Unsupported unary operator: ' + op);
+			}
+
 		case 'ArrayExpression':
 		case 'ObjectExpression':
 		case 'FunctionExpression':
