@@ -695,97 +695,98 @@ class JsMathCallHandlers {
 		}
 
 		// compile argument to a reg or symbol
-		let aRef = this.compileExpressionToReg(aNode);
-		// if it's a symbol (const name) but we have its numeric value, fold at compile-time
-		if (typeof aRef === 'string' && !/^r\d+$/.test(aRef) && this.consts.has(aRef)) {
-			const folded = Math.cbrt(this.consts.get(aRef));
+		let aVal = this.compileExpressionToReg(aNode);
+		// if it's a const symbol with numeric value, fold at compile-time
+		if (typeof aVal === 'string' && !/^r\d+$/.test(aVal) && this.consts.has(aVal)) {
+			const folded = Math.cbrt(this.consts.get(aVal));
 			const t = this.newTemp();
 			this.emit(`move ${t} ${folded}`);
 			return t;
 		}
 
-		// ensure we have a stable aRef we own (either a symbol name or a temp we will keep)
-		// If compileExpressionToReg returned a temp or var reg, move into a temp holder so we can safely use original value repeatedly
-		if (!(typeof aRef === 'string' && !/^r\d+$/.test(aRef))) {
-			// aRef is a register (temp or var). Move into a temp we control.
-			const holder = this.newTemp();
-			this.emit(`move ${holder} ${aRef}`);
-			// if original was a temp, free it
-			if (this.isTempReg(aRef))
-				this.freeTemp(aRef);
-			aRef = holder;
+		// Ensure we have a stable register for the input 'a' (aReg).
+		// If aVal is a symbol (const name), keep it as a symbol (no copy).
+		// If aVal is a register (var or temp), copy it into a dedicated temp aReg we own.
+		let aReg = aVal;
+		if (!(typeof aVal === 'string' && !/^r\d+$/.test(aVal))) {
+			// aVal is a register; copy into our temp aReg so it won't be overwritten.
+			aReg = this.newTemp();
+			this.emit(`move ${aReg} ${aVal}`);
+			if (this.isTempReg(aVal))
+				this.freeTemp(aVal); // free original temp if it was one
 		}
 
-		// runtime zero-check: if aRef == 0 -> return 0 (avoid divide by zero)
+		// Prepare result register (x) which will hold iterative value and final result.
+		const result = this.newTemp();
+
+		// Zero-check: if aReg == 0 -> result = 0 and jump to end
 		const zeroTmp = this.newTemp();
-		this.emit(`seq ${zeroTmp} ${aRef} 0`);
+		this.emit(`seq ${zeroTmp} ${aReg} 0`); // zeroTmp = (aReg == 0) ? 1 : 0
 		const contLabel = this.newLabel('cbrt_cont');
 		const endLabel = this.newLabel('cbrt_end');
-		// if zeroTmp == 0 -> continue; else (non-zero?) seq returns 1 when equal,
-		// so if equal (tmp != 0) we should return zero. We test tmp == 0 to jump to cont.
+		// If zeroTmp == 0 => not zero -> continue
 		this.emit(`beq ${zeroTmp} 0 ${contLabel}`);
-		// zero case: produce zero result register and jump to end
-		const zeroRes = this.newTemp();
-		this.emit(`move ${zeroRes} 0`);
+
+		// zero-case: set result = 0 and jump to end
+		this.emit(`move ${result} 0`);
 		this.emit(`j ${endLabel}`);
-		// continue with Newton iterations
+
+		// non-zero path
 		this.emit(`${contLabel}:`);
-		// free zeroTmp now
 		this.freeTemp(zeroTmp);
 
-		// initial guess x = aRef (in a temp)
-		const x = this.newTemp();
-		this.emit(`move ${x} ${aRef}`);
+		// initial x = aReg
+		this.emit(`move ${result} ${aReg}`);
 
-		// choose number of iterations (6 is more than enough for double precision)
-		const ITER = 6;
-		for (let i = 0; i < ITER; i++) {
-			// x2 = x * x
-			const x2 = this.newTemp();
-			this.emit(`mul ${x2} ${x} ${x}`);
-			// t1 = aRef / x2
-			const t1 = this.newTemp();
-			this.emit(`div ${t1} ${aRef} ${x2}`);
-			// t2 = 2 * x  (use add x x to avoid immediate-mul variants)
-			const t2 = this.newTemp();
-			this.emit(`add ${t2} ${x} ${x}`);
-			// t3 = t2 + t1
-			const t3 = this.newTemp();
-			this.emit(`add ${t3} ${t2} ${t1}`);
-			// x = t3 / 3  (reuse x as destination)
-			this.emit(`div ${x} ${t3} 3`);
-			// free temps we no longer need
-			this.freeTemp(x2);
-			this.freeTemp(t1);
-			this.freeTemp(t2);
-			this.freeTemp(t3);
-			// x remains (either reused dest or temp)
-		}
+		// iteration counter (keep separate register; never reuse aReg)
+		const cnt = this.newTemp();
+		const ITER = 5; // trade-off: 5 iterations is usually enough
+		this.emit(`move ${cnt} ${ITER}`);
 
-		// result in x
-		const result = x;
+		const loopLabel = this.newLabel('cbrt_loop');
+		this.emit(`${loopLabel}:`);
 
-		// cleanup: free aRef if it was a temp we created
-		if (this.isTempReg(aRef))
-			this.freeTemp(aRef);
+		// x2 = x * x
+		const x2 = this.newTemp();
+		this.emit(`mul ${x2} ${result} ${result}`);
 
+		// t1 = a / x2
+		const t1 = this.newTemp();
+		this.emit(`div ${t1} ${aReg} ${x2}`);
+
+		// t2 = 2 * x  (add x x)
+		const t2 = this.newTemp();
+		this.emit(`add ${t2} ${result} ${result}`);
+
+		// t3 = t2 + t1
+		const t3 = this.newTemp();
+		this.emit(`add ${t3} ${t2} ${t1}`);
+
+		// result = t3 / 3
+		this.emit(`div ${result} ${t3} 3`);
+
+		// free intermediates
+		this.freeTemp(x2);
+		this.freeTemp(t1);
+		this.freeTemp(t2);
+		this.freeTemp(t3);
+
+		// decrement counter and loop
+		this.emit(`sub ${cnt} ${cnt} 1`);
+		this.emit(`beq ${cnt} 0 ${endLabel}`);
+		this.emit(`j ${loopLabel}`);
+
+		// end label
 		this.emit(`${endLabel}:`);
-		// If we jumped to end via zero-case, zeroRes exists; otherwise result holds value.
-		// We must decide which register holds valid result at end:
-		// - if zero-case executed, code jumped to end with zeroRes assigned
-		// - else result (x) holds computed value.
-		// To unify, if zeroRes exists, pick a final register to return:
-		// Check: zeroRes exists only when we emitted it. We'll return whichever register is defined.
-		// For simplicity: if zeroRes is defined above, return it; otherwise return result.
-		// (zeroRes is defined in this scope.)
-		if (typeof zeroRes !== 'undefined') {
-			// if result is same as zeroRes, fine; else free result if temp and return zeroRes
-			if (result !== zeroRes) {
-				if (this.isTempReg(result))
-					this.freeTemp(result);
-			}
-			return zeroRes;
-		}
+		// free counter
+		if (this.isTempReg(cnt))
+			this.freeTemp(cnt);
+
+		// aReg: if we created it as a temp above, free it (but only after loop done)
+		if (this.isTempReg(aReg) && aReg !== result)
+			this.freeTemp(aReg);
+
+		// result holds the cbrt (or 0)
 		return result;
 	}
 }
