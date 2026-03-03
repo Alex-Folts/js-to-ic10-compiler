@@ -1,0 +1,505 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Esprima → IC10 (with temp reuse)</title>
+<style>
+  body{font-family:system-ui,Helvetica,Arial;margin:18px}
+  textarea{width:100%;height:160px;font-family:monospace}
+  pre{background:#11110f;color:#e6e6db;padding:12px;border-radius:8px;white-space:pre-wrap}
+  .row{display:flex;gap:12px}
+  .col{flex:1}
+  button{padding:8px 12px;font-size:14px}
+  small {color:#666}
+</style>
+</head>
+<body>
+  <h1>Esprima → IC10 (math + device I/O demo)</h1>
+  <p>Write JS using <code>IC10.d0</code>.. <code>IC10.d5</code> to access device pins. Example: <code>IC10.d0.Temperature</code> or <code>IC10.d1.On = 1</code>.</p>
+
+  <div class="row">
+    <div class="col">
+      <h3>JS source</h3>
+      <textarea id="src">
+// Example: math + device read/write
+var a = 2;
+var b = 10;
+var sum = a + b * 3;
+
+// read temperature from device on d0
+var temp = IC10.d0.Temperature;
+
+// set the On property of device d1 based on condition
+if (sum > temp) {
+  IC10.d1.On = 1;
+} else {
+  IC10.d1.On = 0;
+}
+
+// simple loop: increment a until 5
+while (a < 5) {
+  a = a + 1;
+}
+      </textarea>
+      <p>
+        <button id="compile">Compile → IC10</button>
+		<button id="save_proj">Save</button>
+		<button id="load_proj">Load</button>
+        <button id="clear">Clear output</button>
+        <button id="copy">Copy IC10 out</button>
+		<input id="inp" type='file' style="visibility:hidden;" onchange="readFile(event)" />
+      </p>
+      <small>Supported subset: var/assign, literals, identifiers, binary + - * /, if, while (basic), MemberExpression IC10.dN.Prop.</small>
+    </div>
+
+    <div class="col">
+      <h3>Generated IC10</h3>
+      <pre id="out">(nothing yet)</pre>
+    </div>
+  </div>
+
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/javascript/javascript.min.js"></script>
+
+  <script src="https://unpkg.com/esprima@4.0.1/dist/esprima.js"></script>
+  <script>
+  // ---- Improved IC10Compiler (register reuse) ----
+// DROP-IN: IC10Compiler with JS -> IC10 numeric conversions
+class IC10Compiler {
+  constructor() {
+    this.code = [];
+    this.varReg = new Map();    // js var -> 'rN'
+    this.nextVarReg = 0;        // allocate r0..r7 for vars
+    this.nextTempReg = 8;       // allocate temps r8..r15 when pool empty
+    this.maxReg = 15;
+
+    // temp pool: holds freed temps for reuse (strings like 'r8')
+    this.tempPool = [];
+    // track in-use temps to avoid double-freeing
+    this.tempInUse = new Set();
+
+    // label counter
+    this._labelCounter = 1;
+
+    // const map: name -> numeric value
+    this.consts = new Map();
+    // preamble lines (define ..) collected
+    this.preamble = [];
+  }
+
+  emit(line) { this.code.push(line); }
+
+  // --- helpers for temps/regs (unchanged) ---
+  newTemp() {
+    if (this.tempPool.length > 0) {
+      const r = this.tempPool.pop();
+      this.tempInUse.add(r);
+      return r;
+    }
+    if (this.nextTempReg > this.maxReg) throw new Error('Out of temp registers (r8..r15 exhausted)');
+    const r = 'r' + (this.nextTempReg++);
+    this.tempInUse.add(r);
+    return r;
+  }
+
+  freeTemp(reg) {
+    if (!reg) return;
+    if (!this.isTempReg(reg)) return; // don't free var regs or symbols
+    if (!this.tempInUse.has(reg)) return;
+    this.tempInUse.delete(reg);
+    this.tempPool.push(reg);
+  }
+
+  isTempReg(r) {
+    if (!r || typeof r !== 'string') return false;
+    const m = /^r(\d+)$/.exec(r);
+    if (!m) return false;
+    const n = Number(m[1]);
+    return n >= 8 && n <= this.maxReg;
+  }
+
+  allocVar(name) {
+    if (this.varReg.has(name)) return this.varReg.get(name);
+    if (this.nextVarReg > 7) {
+      if (this.nextVarReg > this.maxReg) throw new Error('Out of registers for variables');
+    }
+    const reg = 'r' + (this.nextVarReg++);
+    this.varReg.set(name, reg);
+    return reg;
+  }
+
+  // --- value conversion helper (central change) ---
+  // Convert JS runtime value into numeric value acceptable for IC10.
+  // throws Error for unsupported types or strings that don't parse to number.
+  convertJsValueToNumber(value, nodeHint) {
+    // null -> 0
+    if (value === null) return 0;
+    const t = typeof value;
+    if (t === 'number') {
+      if (!isFinite(value)) throw new Error('Numeric literal not finite (IC10 requires finite numbers)');
+      return value;
+    }
+    if (t === 'boolean') return value ? 1 : 0;
+    if (t === 'string') {
+      // try parse as number
+      // allow integer or float syntax (parseFloat handles leading/trailing spaces)
+      const n = parseFloat(value);
+      // but ensure whole string is a valid number (reject "12abc")
+      if (isNaN(n) || String(n) !== String(value).trim() && !/^\s*[-+]?\d+(\.\d+)?(\s*)$/.test(String(value))) {
+        // fallback: if parseFloat produced a number but string contains extra characters,
+        // treat as error to be strict as requested.
+        throw new Error(`String literal "${value}" cannot be converted to a numeric value for IC10`);
+      }
+      return n;
+    }
+    // other types unsupported
+    throw new Error(`Unsupported literal type for IC10 conversion: ${t} (node: ${nodeHint || ''})`);
+  }
+
+  // compileProgram: reset preamble/consts and emit them before code
+  compileProgram(ast) {
+    this.code = [];
+    this.preamble = [];
+    this.consts = new Map();
+    this.traverseStatements(ast.body);
+    // emit preamble first (define lines), then code
+    const pre = this.preamble.join('\n');
+    const body = this.code.join('\n');
+    return (pre ? pre + '\n' : '') + body;
+  }
+
+  traverseStatements(list) {
+    for (const s of list) this.compileStatement(s);
+  }
+
+  compileStatement(node) {
+    if (!node) return;
+    switch (node.type) {
+      case 'VariableDeclaration':
+        // handle var/let/const
+        for (const d of node.declarations) {
+          const name = d.id.name;
+          if (node.kind === 'const') {
+            if (!d.init) throw new Error(`const ${name} must have an initializer`);
+            // only allow literal initializers for now
+            if (d.init.type === 'Literal') {
+              const rawVal = d.init.value;
+              const num = this.convertJsValueToNumber(rawVal, `const ${name}`);
+              this.consts.set(name, num);
+              this.preamble.push(`define ${name} ${num}`);
+            } else {
+              throw new Error(`const ${name} must be initialized with a literal (number/boolean/null/string convertible to number)`);
+            }
+          } else {
+            const dest = this.allocVar(name);
+            if (d.init) {
+              const src = this.compileExpressionToReg(d.init);
+              this.emit(`move ${dest} ${src}`);
+              this.freeTemp(src);
+            } else {
+              this.emit(`move ${dest} 0`);
+            }
+          }
+        }
+        break;
+
+      case 'ExpressionStatement':
+        if (node.expression.type === 'AssignmentExpression') {
+          this.compileAssignment(node.expression);
+        } else {
+          const r = this.compileExpressionToReg(node.expression);
+          this.freeTemp(r);
+        }
+        break;
+
+      case 'IfStatement': {
+        const elseLabel = this.newLabel('else');
+        const endLabel = this.newLabel('end');
+        const condReg = this.compileExpressionToReg(node.test);
+        this.emit(`beq ${condReg} 0 ${elseLabel}`);
+        this.freeTemp(condReg);
+        this.compileStatement(node.consequent);
+        this.emit(`j ${endLabel}`);
+        this.emit(`${elseLabel}:`);
+        if (node.alternate) this.compileStatement(node.alternate);
+        this.emit(`${endLabel}:`);
+        break;
+      }
+
+      case 'BlockStatement':
+        this.traverseStatements(node.body);
+        break;
+
+      case 'WhileStatement': {
+        const start = this.newLabel('while_start');
+        const end = this.newLabel('while_end');
+        this.emit(`${start}:`);
+        const condReg = this.compileExpressionToReg(node.test);
+        this.emit(`beq ${condReg} 0 ${end}`);
+        this.freeTemp(condReg);
+        this.compileStatement(node.body);
+        this.emit(`j ${start}`);
+        this.emit(`${end}:`);
+        break;
+      }
+
+      default:
+        throw new Error('Unhandled statement type: ' + node.type);
+    }
+  }
+
+  compileAssignment(node) {
+    if (node.operator !== '=') throw new Error('Only simple assignments supported');
+    const rhsReg = this.compileExpressionToReg(node.right);
+
+    const left = node.left;
+    if (left.type === 'Identifier') {
+      const name = left.name;
+      if (this.consts.has(name)) throw new Error(`Cannot assign to const ${name}`);
+      const dest = this.allocVar(name);
+      this.emit(`move ${dest} ${rhsReg}`);
+      this.freeTemp(rhsReg);
+    } else if (left.type === 'MemberExpression') {
+      const dev = this.resolveIC10Device(left);
+      if (!dev) throw new Error('Unsupported member assignment - expected IC10.dN.Prop');
+      this.emit(`s ${dev.pin} ${dev.prop} ${rhsReg}`);
+      this.freeTemp(rhsReg);
+    } else {
+      throw new Error('Unsupported assignment LHS type: ' + left.type);
+    }
+  }
+
+  // compileExpressionToReg returns:
+  //  - a register name like 'r8' or 'r0'
+  //  - OR a const symbol name like 'MY_CONST' (string that is not r\d+)
+  compileExpressionToReg(node) {
+    if (!node) throw new Error('Null expression');
+    switch (node.type) {
+      case 'Literal': {
+        // Convert literal into numeric value according to rules
+        const converted = this.convertJsValueToNumber(node.value, 'literal');
+        const t = this.newTemp();
+        this.emit(`move ${t} ${converted}`);
+        return t;
+      }
+
+      case 'Identifier': {
+        const name = node.name;
+        if (name === 'undefined') throw new Error('undefined is not supported for IC10 conversion');
+        if (this.consts.has(name)) {
+          return name; // treat const symbol as immediate (the define directive produced numeric value)
+        }
+        // otherwise variable register
+        const r = this.allocVar(name);
+        return r;
+      }
+
+      case 'BinaryExpression': {
+        const leftRegOrSym = this.compileExpressionToReg(node.left);
+
+        let rightIsLiteral = false;
+        let rightVal = null;
+        let rightRegOrSym = null;
+
+        if (node.right.type === 'Literal') {
+          // convert literal to numeric now
+          rightIsLiteral = true;
+          rightVal = this.convertJsValueToNumber(node.right.value, 'binary-right-literal');
+        } else {
+          rightRegOrSym = this.compileExpressionToReg(node.right);
+          // if rightRegOrSym is a string that is not register, treat as immediate (const)
+          if (typeof rightRegOrSym === 'string' && !/^r\d+$/.test(rightRegOrSym) && !this.isTempReg(rightRegOrSym)) {
+            rightIsLiteral = true;
+            rightVal = rightRegOrSym; // symbol name
+            rightRegOrSym = null;
+          }
+        }
+
+        const leftIsTemp = this.isTempReg(leftRegOrSym);
+        const rightIsTemp = this.isTempReg(rightRegOrSym);
+
+        let dest = null;
+        if (rightIsTemp) {
+          dest = rightRegOrSym;
+        } else if (leftIsTemp) {
+          dest = leftRegOrSym;
+        } else {
+          dest = this.newTemp();
+        }
+
+        const op = this.mapBinaryOp(node.operator);
+        if (rightIsLiteral) {
+          // rightVal either numeric or const symbol string
+          this.emit(`${op} ${dest} ${leftRegOrSym} ${rightVal}`);
+        } else {
+          this.emit(`${op} ${dest} ${leftRegOrSym} ${rightRegOrSym}`);
+        }
+
+        if (leftRegOrSym !== dest) this.freeTemp(leftRegOrSym);
+        if (rightRegOrSym && rightRegOrSym !== dest) this.freeTemp(rightRegOrSym);
+
+        return dest;
+      }
+
+      case 'MemberExpression': {
+        const dev = this.resolveIC10Device(node);
+        if (!dev) throw new Error('Unsupported MemberExpression (only IC10.dN.Prop supported for reads)');
+        const dest = this.newTemp();
+        this.emit(`l ${dest} ${dev.pin} ${dev.prop}`);
+        return dest;
+      }
+
+      case 'UpdateExpression': {
+        if (node.argument.type !== 'Identifier') throw new Error('Only simple ++/-- on identifiers supported');
+        const name = node.argument.name;
+        if (this.consts.has(name)) throw new Error(`Cannot update const ${name}`);
+        const reg = this.allocVar(name);
+        const plus = node.operator === '++' ? 'add' : (node.operator === '--' ? 'sub' : null);
+        if (!plus) throw new Error('Unsupported update operator ' + node.operator);
+        if (node.prefix) {
+          this.emit(`${plus} ${reg} ${reg} 1`);
+          return reg;
+        } else {
+          const tmp = this.newTemp();
+          this.emit(`move ${tmp} ${reg}`);
+          this.emit(`${plus} ${reg} ${reg} 1`);
+          return tmp;
+        }
+      }
+
+      // explicitly reject complex/unsupported nodes early
+      case 'ArrayExpression':
+      case 'ObjectExpression':
+      case 'FunctionExpression':
+      case 'ArrowFunctionExpression':
+        throw new Error(`Unsupported expression type for IC10 conversion: ${node.type}`);
+
+      default:
+        throw new Error('Unhandled expression type: ' + node.type);
+    }
+  }
+
+  mapBinaryOp(op) {
+    switch (op) {
+      case '+': return 'add';
+      case '-': return 'sub';
+      case '*': return 'mul';
+      case '/': return 'div';
+      case '%': return 'mod';
+      case '==': case '===': return 'seq';
+      case '!=': return 'sne';
+      case '<': return 'slt';
+      case '<=': return 'sle';
+      case '>': return 'sgt';
+      case '>=': return 'sge';
+    }
+    throw new Error('Unsupported binary operator: ' + op);
+  }
+
+  resolveIC10Device(node) {
+    if (node.type !== 'MemberExpression') return null;
+    const chain = [];
+    let cur = node;
+    while (cur && cur.type === 'MemberExpression') {
+      const prop = cur.property.type === 'Identifier' ? cur.property.name
+                 : (cur.property.type === 'Literal' ? String(cur.property.value) : null);
+      if (prop === null) return null;
+      chain.unshift(prop);
+      cur = cur.object;
+    }
+    if (!cur || cur.type !== 'Identifier' || cur.name !== 'IC10') return null;
+    if (chain.length < 1) return null;
+    const pin = chain[0];
+    const prop = (chain.length > 1) ? chain[1] : null;
+    if (!/^d[0-5]$/.test(pin) && pin !== 'db') {
+      throw new Error('Unsupported device pin: ' + pin + '. Use d0..d5 or db.');
+    }
+    if (!prop) throw new Error('Device property missing (IC10.dN.Prop).');
+    return { pin, prop };
+  }
+
+  newLabel(prefix='L') {
+    return `${prefix}${this._labelCounter++}`;
+  }
+}
+
+  //Utils
+  function copyTextToClipboard(text) {
+    navigator.clipboard.writeText(text).then(function() {
+	  console.log('Async: Copying to clipboard was successful!');
+    }, function(err) {
+  	  console.error('Async: Could not copy text: ', err);
+    });
+  }
+ 
+  function download(filename, text) {
+    var element = document.createElement('a');
+    element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+    element.setAttribute('download', filename);
+
+    element.style.display = 'none';
+    document.body.appendChild(element);
+
+    element.click();
+
+    document.body.removeChild(element);
+  }
+
+
+  // turn the existing textarea into a CodeMirror editor
+  const editor = CodeMirror.fromTextArea(document.getElementById('src'), {
+    mode: 'javascript',
+    lineNumbers: true,
+    tabSize: 2,
+    indentWithTabs: false
+  });
+
+  // ---- UI wiring ----
+  const out = document.getElementById('out');
+  document.getElementById('compile').addEventListener('click', () => {
+    //const src = document.getElementById('src').value;
+	const src = editor.getValue();
+    let ast;
+    try {
+      ast = esprima.parseScript(src);
+    } catch (e) {
+      out.textContent = 'Parse error: ' + e.message;
+      return;
+    }
+    try {
+      const c = new IC10Compiler();
+      const ic = c.compileProgram(ast);
+      out.textContent = ic;
+    } catch (e) {
+      out.textContent = 'Compile error: ' + e.message;
+    }
+  });
+  document.getElementById('clear').addEventListener('click', () => out.textContent = '');
+  document.getElementById('copy').addEventListener('click', () => copyTextToClipboard(out.textContent));
+  document.getElementById('save_proj').addEventListener('click', () => {
+	const src = editor.getValue();
+	const projObj = {source: src};
+	download('project.json', JSON.stringify(projObj));
+  });
+  document.getElementById('load_proj').addEventListener('click', () => {
+	document.getElementById('inp').click();
+	//hack
+	document.getElementById('inp').onclick = function () {
+	  this.value = null;
+	};
+  });
+  function readFile(e) {
+    var file = e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(e) {
+	  const src = e.target.result;
+	  const projObj = JSON.parse(src);
+	  editor.setValue(projObj.source);
+    }
+    reader.readAsText(file)
+  }
+  </script>
+</body>
+</html>
