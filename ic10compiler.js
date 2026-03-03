@@ -497,6 +497,36 @@ class IC10Compiler {
 				return result;
 			}
 
+		case 'ConditionalExpression': {
+				// Compile test, consequent, alternate
+				const cond = this.compileExpressionToReg(node.test);
+				const cons = this.compileExpressionToReg(node.consequent);
+				const alt = this.compileExpressionToReg(node.alternate);
+
+				// Choose destination: prefer reusing a temp operand (cons or alt) to avoid extra alloc
+				let dest = null;
+				if (this.isTempReg(cons))
+					dest = cons;
+				else if (this.isTempReg(alt))
+					dest = alt;
+				else
+					dest = this.newTemp();
+
+				// Emit select: select dest cond cons alt
+				// IC10: select r? a b c  -> r? = b if a != 0 else c
+				this.emit(`select ${dest} ${cond} ${cons} ${alt}`);
+
+				// Free operand temps that were not reused as the destination
+				if (cond !== dest && this.isTempReg(cond))
+					this.freeTemp(cond);
+				if (cons !== dest && this.isTempReg(cons))
+					this.freeTemp(cons);
+				if (alt !== dest && this.isTempReg(alt))
+					this.freeTemp(alt);
+
+				return dest;
+			}
+
 		case 'ArrayExpression':
 		case 'ObjectExpression':
 		case 'FunctionExpression':
