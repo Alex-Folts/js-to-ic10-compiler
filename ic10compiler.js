@@ -1,7 +1,8 @@
-// ---- Improved IC10Compiler (register reuse) ----
-// ---------- IC10Compiler (namespace-aware call handlers) ----------
+// ---------- IC10Compiler (optimized + debug/compact mode) ----------
 class IC10Compiler {
-	constructor() {
+	constructor(opts = {}) {
+		this.debug = opts.debug === undefined ? true : !!opts.debug; // true = labels, false = compact numeric jumps
+
 		this.code = [];
 		this.varReg = new Map();
 		this.nextVarReg = 0; // r0..r7 for vars
@@ -66,7 +67,6 @@ class IC10Compiler {
 		const top = this.callHandlers.get(ns);
 		if (top && top.has(name))
 			return top.get(name);
-		// also try empty namespace '' if present
 		const empty = this.callHandlers.get('');
 		if (empty && empty.has(name))
 			return empty.get(name);
@@ -125,16 +125,26 @@ class IC10Compiler {
 
 	// -------------------------------------------------------------------
 	compileProgram(ast) {
+		// reset state (do not reset debug)
 		this.code = [];
 		this.preamble = [];
 		this.consts = new Map();
 		this.breakStack = [];
 		this.continueStack = [];
+
 		this.traverseStatements(ast.body);
-		const pre = this.preamble.join('\n');
-		const body = this.code.join('\n');
-		return (pre ? pre + '\n' : '') + body;
+
+		// finalize code: either keep labeled debug form or compact numeric form
+		if (this.debug) {
+			const pre = this.preamble.join('\n');
+			const body = this.code.join('\n');
+			return (pre ? pre + '\n' : '') + body;
+		} else {
+			// compact mode: resolve labels to numbers and remove label lines
+			return this._finalizeCompactOutput();
+		}
 	}
+
 	traverseStatements(list) {
 		for (const s of list)
 			this.compileStatement(s);
@@ -161,9 +171,28 @@ class IC10Compiler {
 				} else {
 					const dest = this.allocVar(name);
 					if (d.init) {
-						const src = this.compileExpressionToReg(d.init);
-						this.emit(`move ${dest} ${src}`);
-						this.freeTemp(src);
+						// Optimization: if init is a literal/const identifier/identifier (existing var), avoid creating temp
+						if (d.init.type === 'Literal') {
+							const v = this.convertJsValueToNumber(d.init.value, `var init ${name}`);
+							this.emit(`move ${dest} ${v}`);
+						} else if (d.init.type === 'Identifier') {
+							const inName = d.init.name;
+							if (this.consts.has(inName)) {
+								this.emit(`move ${dest} ${inName}`);
+							} else if (this.varReg.has(inName)) {
+								this.emit(`move ${dest} ${this.varReg.get(inName)}`);
+							} else {
+								// identifier not declared yet — compile expression normally
+								const src = this.compileExpressionToReg(d.init);
+								this.emit(`move ${dest} ${src}`);
+								this.freeTemp(src);
+							}
+						} else {
+							// fallback to general expression
+							const src = this.compileExpressionToReg(d.init);
+							this.emit(`move ${dest} ${src}`);
+							this.freeTemp(src);
+						}
 					} else {
 						this.emit(`move ${dest} 0`);
 					}
@@ -184,8 +213,52 @@ class IC10Compiler {
 			break;
 
 		case 'IfStatement': {
+				// Try to emit specialized branch if test is a simple binary comparison
 				const elseLabel = this.newLabel('else');
 				const endLabel = this.newLabel('end');
+
+				const test = node.test;
+				const cmpOps = new Set(['<', '<=', '>', '>=', '==', '===', '!=']);
+				if (test && test.type === 'BinaryExpression' && cmpOps.has(test.operator)) {
+					// compile left/right but avoid creating temps when possible (literal/identifier/const/MemberExpression)
+					const left = test.left;
+					const right = test.right;
+
+					const leftVal = this._compileSimpleValueOrReg(left);
+					const rightVal = this._compileSimpleValueOrReg(right);
+
+					// map operator to inverse branch that jumps to else when test is false
+					// For '<' -> jump if left >= right -> bge left right else
+					const inverseBranch = {
+						'<': 'bge',
+						'<=': 'bgt',
+						'>': 'ble',
+						'>=': 'blt',
+						'==': 'bne',
+						'===': 'bne',
+						'!=': 'beq'
+					}
+					[test.operator];
+
+					if (inverseBranch) {
+						this.emit(`${inverseBranch} ${leftVal} ${rightVal} ${elseLabel}`);
+						// free any temps returned by _compileSimpleValueOrReg
+						if (this.isTempReg(leftVal))
+							this.freeTemp(leftVal);
+						if (this.isTempReg(rightVal))
+							this.freeTemp(rightVal);
+						// then body / jump to end / else
+						this.compileStatement(node.consequent);
+						this.emit(`j ${endLabel}`);
+						this.emit(`${elseLabel}:`);
+						if (node.alternate)
+							this.compileStatement(node.alternate);
+						this.emit(`${endLabel}:`);
+						break;
+					}
+				}
+
+				// fallback to general approach (compute truthy numeric and test)
 				const condReg = this.compileExpressionToReg(node.test);
 				this.emit(`beq ${condReg} 0 ${elseLabel}`);
 				this.freeTemp(condReg);
@@ -337,6 +410,35 @@ class IC10Compiler {
 	compileAssignment(node) {
 		if (node.operator !== '=')
 			throw new Error('Only simple assignments supported');
+
+		// If RHS is simple literal or identifier/const we can avoid temp
+		if (node.right.type === 'Literal' && node.left.type === 'Identifier') {
+			const val = this.convertJsValueToNumber(node.right.value, 'assign-literal');
+			const name = node.left.name;
+			if (this.consts.has(name))
+				throw new Error(`Cannot assign to const ${name}`);
+			const dest = this.allocVar(name);
+			this.emit(`move ${dest} ${val}`);
+			return;
+		}
+		if (node.right.type === 'Identifier' && node.left.type === 'Identifier') {
+			const srcName = node.right.name,
+			dstName = node.left.name;
+			const name = dstName;
+			if (this.consts.has(name))
+				throw new Error(`Cannot assign to const ${name}`);
+			const dest = this.allocVar(name);
+			if (this.consts.has(srcName)) {
+				this.emit(`move ${dest} ${srcName}`);
+				return;
+			}
+			if (this.varReg.has(srcName)) {
+				this.emit(`move ${dest} ${this.varReg.get(srcName)}`);
+				return;
+			}
+			// fallback to general
+		}
+
 		const rhsReg = this.compileExpressionToReg(node.right);
 		const left = node.left;
 		if (left.type === 'Identifier') {
@@ -454,18 +556,13 @@ class IC10Compiler {
 			}
 
 		case 'CallExpression': {
-				// support MemberExpression chains of arbitrary depth for namespace
 				const callee = node.callee;
 				if (callee.type !== 'MemberExpression')
-					throw new Error('Only namespaced CallExpressions (e.g. IC10.foo(), Math.atan2()) supported currently');
-
-				// extract function name (property) and namespace string from object chain
+					throw new Error('Only namespaced CallExpressions supported');
 				const funcName = (callee.property.type === 'Identifier') ? callee.property.name
 				 : (callee.property.type === 'Literal' ? String(callee.property.value) : null);
 				if (!funcName)
 					throw new Error('Unsupported call property type');
-
-				// build namespace string from callee.object (walk MemberExpression/Identifier chain)
 				let nsParts = [];
 				let cur = callee.object;
 				while (cur) {
@@ -498,12 +595,10 @@ class IC10Compiler {
 			}
 
 		case 'ConditionalExpression': {
-				// Compile test, consequent, alternate
 				const cond = this.compileExpressionToReg(node.test);
 				const cons = this.compileExpressionToReg(node.consequent);
 				const alt = this.compileExpressionToReg(node.alternate);
 
-				// Choose destination: prefer reusing a temp operand (cons or alt) to avoid extra alloc
 				let dest = null;
 				if (this.isTempReg(cons))
 					dest = cons;
@@ -512,11 +607,8 @@ class IC10Compiler {
 				else
 					dest = this.newTemp();
 
-				// Emit select: select dest cond cons alt
-				// IC10: select r? a b c  -> r? = b if a != 0 else c
 				this.emit(`select ${dest} ${cond} ${cons} ${alt}`);
 
-				// Free operand temps that were not reused as the destination
 				if (cond !== dest && this.isTempReg(cond))
 					this.freeTemp(cond);
 				if (cons !== dest && this.isTempReg(cons))
@@ -536,6 +628,30 @@ class IC10Compiler {
 		default:
 			throw new Error('Unhandled expression type: ' + node.type);
 		}
+	}
+
+	// helper: compile simple literal/identifier/member into immediate/symbol/reg or temp
+	_compileSimpleValueOrReg(node) {
+		if (!node)
+			throw new Error('Null node');
+		if (node.type === 'Literal')
+			return this.convertJsValueToNumber(node.value, 'simple-literal');
+		if (node.type === 'Identifier') {
+			const n = node.name;
+			if (this.consts.has(n))
+				return n;
+			// if var exists, return its reg
+			if (this.varReg.has(n))
+				return this.varReg.get(n);
+			// otherwise allocate (deferred) — fallback to allocating a var for identifier
+			return this.allocVar(n);
+		}
+		if (node.type === 'MemberExpression') {
+			// compile member read into temp reg and return it
+			return this.compileExpressionToReg(node); // this will return a temp (and the caller should free later)
+		}
+		// fallback: compile general expression
+		return this.compileExpressionToReg(node);
 	}
 
 	// ---------------- helpers / conversion ----------------
@@ -617,6 +733,54 @@ class IC10Compiler {
 			pin,
 			prop
 		};
+	}
+
+	// ---------------- compact-mode finalizer ----------------
+	_finalizeCompactOutput() {
+		// Number of preamble lines (e.g. "define ..." ). These lines will appear
+		// at the top of the output and therefore must be counted when computing
+		// absolute jump targets.
+		const preambleCount = this.preamble.length;
+
+		// Build mapping of labels -> numeric index (after removing label lines).
+		const labelToIndex = new Map();
+		const outLines = [];
+
+		// First pass: record label positions (index in resulting outLines + preambleCount)
+		for (let i = 0; i < this.code.length; i++) {
+			const line = this.code[i].trim();
+			const labelMatch = /^([A-Za-z_]\w*):$/.exec(line);
+			if (labelMatch) {
+				// label maps to the index it will have in the final output,
+				// which is (current outLines length) + number of preamble lines.
+				labelToIndex.set(labelMatch[1], outLines.length + preambleCount);
+			} else {
+				outLines.push(line);
+			}
+		}
+
+		// Second pass: replace label operands in jump-like instructions with numeric indices
+		const jumpOpNames = new Set(['j', 'beq', 'bne', 'blt', 'bgt', 'ble', 'bge']);
+		const replaced = outLines.map((ln) => {
+				// split tokens to inspect last token (jump target is usually the last token)
+				const parts = ln.split(/\s+/).filter(Boolean);
+				if (parts.length === 0)
+					return ln;
+				const op = parts[0];
+				if (jumpOpNames.has(op) && parts.length >= 2) {
+					const last = parts[parts.length - 1];
+					if (labelToIndex.has(last)) {
+						const idx = labelToIndex.get(last);
+						parts[parts.length - 1] = String(idx);
+						return parts.join(' ');
+					}
+				}
+				return ln;
+			});
+
+		// Prepend preamble (if any)
+		const pre = this.preamble.length ? (this.preamble.join('\n') + '\n') : '';
+		return pre + replaced.join('\n');
 	}
 }
 // ---------- end IC10Compiler ----------

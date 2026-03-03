@@ -115,7 +115,7 @@ while (a < 5) {
 			return;
 		}
 		try {
-			const c = new IC10Compiler();
+			const c = new IC10Compiler({ debug: false });
 
 			const jsIC10CallHandlers = new JsIC10CallHandlers();
 			jsIC10CallHandlers.Register(c);
