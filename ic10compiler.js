@@ -23,6 +23,10 @@ class IC10Compiler {
 		// stacks for break/continue label targets (support nested constructs)
 		this.breakStack = [];
 		this.continueStack = [];
+
+		// new fields in constructor
+		this.stackVars = new Map(); // name -> stackAddress (number)
+		this.nextStackAddr = 0; // next free stack slot index (0-based)
 	}
 
 	// -------------------------------------------------------------------
@@ -109,15 +113,122 @@ class IC10Compiler {
 		return n >= 8 && n <= this.maxReg;
 	}
 	allocVar(name) {
+		// if already allocated as a register, return it
 		if (this.varReg.has(name))
 			return this.varReg.get(name);
-		if (this.nextVarReg > 7) {
-			if (this.nextVarReg > this.maxReg)
-				throw new Error('Out of registers for variables');
+
+		// if we still have r0..r7 free, allocate variable register
+		if (this.nextVarReg <= 7) {
+			const reg = 'r' + (this.nextVarReg++);
+			this.varReg.set(name, reg);
+			return reg;
 		}
-		const reg = 'r' + (this.nextVarReg++);
-		this.varReg.set(name, reg);
-		return reg;
+
+		// otherwise allocate a stack slot (if not already)
+		if (this.stackVars.has(name)) {
+			const addr = this.stackVars.get(name);
+			return `@stk${addr}`;
+		}
+
+		const addr = this.nextStackAddr++;
+		this.stackVars.set(name, addr);
+
+		// implicit allocation: reserve a slot by pushing 0 (so the address becomes valid)
+		// For implicitly allocated variables we push 0 as initial content.
+		// (Explicit declarations should use allocVarForDeclaration to push desired init value)
+		this.emit(`push 0`);
+
+		return `@stk${addr}`;
+	}
+	allocVarForDeclaration(name, initNode) {
+		// if register already allocated, return it
+		if (this.varReg.has(name))
+			return this.varReg.get(name);
+
+		// allocate register if available
+		if (this.nextVarReg <= 7) {
+			const reg = 'r' + (this.nextVarReg++);
+			this.varReg.set(name, reg);
+			// caller will emit move reg <init> if needed
+			return reg;
+		}
+
+		// allocate stack slot
+		if (this.stackVars.has(name)) {
+			const addr = this.stackVars.get(name);
+			return `@stk${addr}`;
+		}
+
+		const addr = this.nextStackAddr++;
+		this.stackVars.set(name, addr);
+
+		// emit push with initializer (if provided) or push 0
+		if (initNode) {
+			// If initializer is a simple literal or const symbol, push immediate/symbol
+			if (initNode.type === 'Literal') {
+				const v = this.convertJsValueToNumber(initNode.value, `var init ${name}`);
+				this.emit(`push ${v}`);
+			} else if (initNode.type === 'Identifier' && this.consts.has(initNode.name)) {
+				// push const symbol
+				this.emit(`push ${initNode.name}`);
+			} else {
+				// compile general expression to reg and push it
+				const src = this.compileExpressionToReg(initNode);
+				this.emit(`push ${src}`);
+				if (this.isTempReg(src))
+					this.freeTemp(src);
+			}
+		} else {
+			this.emit(`push 0`);
+		}
+
+		return `@stk${addr}`;
+	}
+	// read stack variable at absolute address 'addr' and return a temp register with value
+	// loadStackVar(addr) -> returns a temp register containing the variable value.
+	// Caller MUST free the returned temp when done.
+	loadStackVar(addr) {
+		if (typeof addr !== 'number' || addr < 0)
+			throw new Error('Invalid stack address: ' + addr);
+		const SP_LIMIT = 512;
+		const targetSp = addr + 1; // peek reads sp-1, so set sp = addr+1
+
+		if (targetSp < 0 || targetSp > SP_LIMIT)
+			throw new Error(`Stack address out of range: ${addr} (target sp ${targetSp})`);
+
+		const tmpSp = this.newTemp(); // save current sp
+		this.emit(`move ${tmpSp} sp`);
+		this.emit(`move sp ${targetSp}`); // set sp so peek reads addr (sp-1)
+		const val = this.newTemp(); // temp to receive value
+		this.emit(`peek ${val}`); // val = stack[sp-1] == stack[addr]
+		this.emit(`move sp ${tmpSp}`); // restore old sp
+		this.freeTemp(tmpSp);
+		return val;
+	}
+	// storeStackVar(addr, value) -> writes value into stack slot at addr.
+	// value may be a number, a symbol string, or a register name (rN).
+	// Frees any temporary it creates.
+	storeStackVar(addr, value) {
+		if (typeof addr !== 'number' || addr < 0)
+			throw new Error('Invalid stack address: ' + addr);
+		const SP_LIMIT = 512;
+		if (addr < 0 || addr >= SP_LIMIT)
+			throw new Error(`Stack address out of range: ${addr}`);
+
+		// poke semantics: poke <address> <reg>
+		// If value is immediate/symbol, move it to a temp then poke
+		if (typeof value === 'number' || (typeof value === 'string' && !/^r\d+$/.test(value))) {
+			const tmp = this.newTemp();
+			this.emit(`move ${tmp} ${value}`);
+			this.emit(`poke ${addr} ${tmp}`);
+			this.freeTemp(tmp);
+			return;
+		}
+
+		// value is a register like rN
+		this.emit(`poke ${addr} ${value}`);
+		if (this.isTempReg(value))
+			this.freeTemp(value);
 	}
 	newLabel(prefix = 'L') {
 		return `${prefix}${this._labelCounter++}`;
@@ -174,32 +285,38 @@ class IC10Compiler {
 						throw new Error(`const ${name} initializer error: ${e.message}`);
 					}
 				} else {
-					const dest = this.allocVar(name);
-					if (d.init) {
-						// Optimization: if init is a literal/const identifier/identifier (existing var), avoid creating temp
-						if (d.init.type === 'Literal') {
-							const v = this.convertJsValueToNumber(d.init.value, `var init ${name}`);
-							this.emit(`move ${dest} ${v}`);
-						} else if (d.init.type === 'Identifier') {
-							const inName = d.init.name;
-							if (this.consts.has(inName)) {
-								this.emit(`move ${dest} ${inName}`);
-							} else if (this.varReg.has(inName)) {
-								this.emit(`move ${dest} ${this.varReg.get(inName)}`);
+					// non-const (var/let)
+					const destToken = this.allocVarForDeclaration(name, d.init);
+					if (destToken && typeof destToken === 'string' && destToken.startsWith('@stk')) {
+						// stack-backed var: allocVarForDeclaration already emitted the push for initialization.
+						// nothing further to emit here (push already placed init value)
+					} else {
+						// destToken is a register like 'r0' -- handle initialization (we didn't auto-push)
+						const dest = destToken;
+						if (d.init) {
+							// if initializer is simple literal/const/identifier we already handled simple moves earlier
+							if (d.init.type === 'Literal') {
+								const v = this.convertJsValueToNumber(d.init.value, `var init ${name}`);
+								this.emit(`move ${dest} ${v}`);
+							} else if (d.init.type === 'Identifier') {
+								const inName = d.init.name;
+								if (this.consts.has(inName)) {
+									this.emit(`move ${dest} ${inName}`);
+								} else if (this.varReg.has(inName)) {
+									this.emit(`move ${dest} ${this.varReg.get(inName)}`);
+								} else {
+									const src = this.compileExpressionToReg(d.init);
+									this.emit(`move ${dest} ${src}`);
+									this.freeTemp(src);
+								}
 							} else {
-								// identifier not declared yet — compile expression normally
 								const src = this.compileExpressionToReg(d.init);
 								this.emit(`move ${dest} ${src}`);
 								this.freeTemp(src);
 							}
 						} else {
-							// fallback to general expression
-							const src = this.compileExpressionToReg(d.init);
-							this.emit(`move ${dest} ${src}`);
-							this.freeTemp(src);
+							this.emit(`move ${dest} 0`);
 						}
-					} else {
-						this.emit(`move ${dest} 0`);
 					}
 				}
 			}
@@ -430,8 +547,27 @@ class IC10Compiler {
 				if (this.consts.has(name))
 					throw new Error(`Cannot assign to const ${name}`);
 				const dest = this.allocVar(name);
-				this.emit(`move ${dest} ${rhsReg}`);
-				this.freeTemp(rhsReg);
+
+				// If dest is stack-backed, poke instead of move
+				if (typeof dest === 'string' && dest.startsWith('@stk')) {
+					const addr = parseInt(dest.slice(4), 10);
+					// if rhsReg is immediate or symbol, move to temp then poke
+					if (typeof rhsReg === 'number' || (typeof rhsReg === 'string' && !/^r\d+$/.test(rhsReg))) {
+						const tmp = this.newTemp();
+						this.emit(`move ${tmp} ${rhsReg}`);
+						this.emit(`poke ${addr} ${tmp}`);
+						this.freeTemp(tmp);
+					} else {
+						// rhsReg is a register
+						this.emit(`poke ${addr} ${rhsReg}`);
+						if (this.isTempReg(rhsReg))
+							this.freeTemp(rhsReg);
+					}
+				} else {
+					// register-backed var
+					this.emit(`move ${dest} ${rhsReg}`);
+					this.freeTemp(rhsReg);
+				}
 			} else if (left.type === 'MemberExpression') {
 				const dev = this.resolveIC10Device(left);
 				if (!dev)
@@ -480,20 +616,50 @@ class IC10Compiler {
 			// compile RHS
 			const rhsVal = compileRHSAsValue(node.right);
 
-			// If RHS is an immediate (number or symbol string), emit op in-place
+			// If dest is stack-backed, we need to load current, compute and poke back.
+			if (typeof dest === 'string' && dest.startsWith('@stk')) {
+				const addr = parseInt(dest.slice(4), 10);
+				// load current into temp
+				const cur = this.loadStackVar(addr); // returns temp
+				// handle rhsVal immediate/symbol
+				if (typeof rhsVal === 'number' || (typeof rhsVal === 'string' && !/^r\d+$/.test(rhsVal))) {
+					// compute cur = cur op rhsVal
+					this.emit(`${op} ${cur} ${cur} ${rhsVal}`);
+					this.emit(`poke ${addr} ${cur}`);
+					this.freeTemp(cur);
+					return;
+				} else {
+					// rhsVal is register (maybe temp)
+					const rhsIsTemp = this.isTempReg(rhsVal);
+					if (rhsIsTemp) {
+						// do rhsVal = cur op rhsVal ; then poke rhsVal
+						this.emit(`${op} ${rhsVal} ${cur} ${rhsVal}`);
+						this.emit(`poke ${addr} ${rhsVal}`);
+						this.freeTemp(cur);
+						this.freeTemp(rhsVal);
+						return;
+					} else {
+						// rhsVal is a non-temp reg; compute into cur and poke
+						this.emit(`${op} ${cur} ${cur} ${rhsVal}`);
+						this.emit(`poke ${addr} ${cur}`);
+						this.freeTemp(cur);
+						return;
+					}
+				}
+			}
+
+			// dest is register-backed var
 			if (typeof rhsVal === 'number' || (typeof rhsVal === 'string' && !/^r\d+$/.test(rhsVal))) {
 				this.emit(`${op} ${dest} ${dest} ${rhsVal}`);
 				return;
 			}
 
 			// rhsVal is a register (maybe same as dest)
-			// prefer reusing rhsVal as temp dest if it's a temp, but we want result to live in dest var.
 			if (rhsVal === dest) {
-				// case: a += a  => add dest dest dest (safe)
+				// a += a  -> add dest dest dest
 				this.emit(`${op} ${dest} ${dest} ${dest}`);
 			} else {
 				this.emit(`${op} ${dest} ${dest} ${rhsVal}`);
-				// free rhs temp if it was a temp and not equal to dest
 				if (this.isTempReg(rhsVal) && rhsVal !== dest)
 					this.freeTemp(rhsVal);
 			}
@@ -515,47 +681,30 @@ class IC10Compiler {
 
 			// choose destination for computation: prefer reusing rhs temp if it's temp,
 			// otherwise reuse cur so we can s ... dest afterward.
-			let dest = null;
 			if (typeof rhsVal === 'string' && !/^r\d+$/.test(rhsVal)) {
 				// immediate/symbol: compute into cur (cur = op cur imm)
-				dest = cur;
-				this.emit(`${op} ${dest} ${cur} ${rhsVal}`);
-				// store result
-				this.emit(`s ${dev.pin} ${dev.prop} ${dest}`);
-				// free cur temp
+				this.emit(`${op} ${cur} ${cur} ${rhsVal}`);
+				this.emit(`s ${dev.pin} ${dev.prop} ${cur}`);
 				this.freeTemp(cur);
 				return;
 			}
 
-			// rhsVal is register (maybe temp)
+			// rhsVal is a register (maybe temp)
 			const rhsIsTemp = this.isTempReg(rhsVal);
-			const curIsTemp = this.isTempReg(cur);
 
-			// prefer reusing rhsVal as dest if it's a temp (saves a temp)
+			// prefer reusing rhsVal as dest if it's a temp
 			if (rhsIsTemp) {
-				dest = rhsVal;
-				// perform dest = cur op dest  -> but op expects dest as first arg so we must move cur into dest's left operand:
-				// We want dest = cur <op> dest
-				this.emit(`${op} ${dest} ${cur} ${dest}`);
-				// store and free cur (and dest will be used to store)
-				this.emit(`s ${dev.pin} ${dev.prop} ${dest}`);
-				// free cur temp
+				// perform rhsVal = cur op rhsVal
+				this.emit(`${op} ${rhsVal} ${cur} ${rhsVal}`);
+				this.emit(`s ${dev.pin} ${dev.prop} ${rhsVal}`);
 				this.freeTemp(cur);
-				// dest is temp holding result; free it (since stored) if it's a temp
-				if (this.isTempReg(dest))
-					this.freeTemp(dest);
+				this.freeTemp(rhsVal);
 				return;
 			} else {
-				// rhsVal is a non-temp register (var or symbol's register handled earlier) or maybe same as cur (unlikely)
-				// compute into cur: cur = cur op rhsVal
+				// rhsVal is a non-temp register; compute into cur: cur = cur op rhsVal
 				this.emit(`${op} ${cur} ${cur} ${rhsVal}`);
-				// store result
 				this.emit(`s ${dev.pin} ${dev.prop} ${cur}`);
-				// free cur temp
 				this.freeTemp(cur);
-				// if rhsVal is a temp (shouldn't be here), free it
-				if (this.isTempReg(rhsVal))
-					this.freeTemp(rhsVal);
 				return;
 			}
 		}
@@ -586,9 +735,27 @@ class IC10Compiler {
 				if (name === 'NaN')
 					return 'nan';
 
+				// compile-time const symbol
 				if (this.consts.has(name))
-					return name; // symbol immediate (previously defined const)
-				return this.allocVar(name);
+					return name;
+
+				// if var mapped to register
+				if (this.varReg.has(name))
+					return this.varReg.get(name);
+
+				// if var mapped to stack slot, load it into a temp and return that temp
+				if (this.stackVars.has(name)) {
+					const addr = this.stackVars.get(name);
+					return this.loadStackVar(addr); // returns temp register; caller must free
+				}
+
+				// not allocated yet: allocate (allocVar will push 0 if stack slot allocated)
+				const alloc = this.allocVar(name);
+				if (typeof alloc === 'string' && alloc.startsWith('@stk')) {
+					const addr = parseInt(alloc.slice(4), 10);
+					return this.loadStackVar(addr);
+				}
+				return alloc; // register like 'rN'
 			}
 
 		case 'BinaryExpression': {
@@ -862,11 +1029,21 @@ class IC10Compiler {
 			const n = node.name;
 			if (this.consts.has(n))
 				return n;
-			// if var exists, return its reg
+			// if var exists in registers, return reg
 			if (this.varReg.has(n))
 				return this.varReg.get(n);
-			// otherwise allocate (deferred) — fallback to allocating a var for identifier
-			return this.allocVar(n);
+			// if stack var exists, return temp with loaded value
+			if (this.stackVars.has(n)) {
+				const addr = this.stackVars.get(n);
+				return this.loadStackVar(addr); // returns a temp register (caller should free it)
+			}
+			// otherwise allocate (this will push 0 if it becomes stack)
+			const alloc = this.allocVar(n);
+			if (typeof alloc === 'string' && alloc.startsWith('@stk')) {
+				const addr = parseInt(alloc.slice(4), 10);
+				return this.loadStackVar(addr);
+			}
+			return alloc;
 		}
 		if (node.type === 'MemberExpression') {
 			// compile member read into temp reg and return it
