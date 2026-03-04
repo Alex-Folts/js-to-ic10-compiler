@@ -413,55 +413,154 @@ class IC10Compiler {
 	}
 
 	compileAssignment(node) {
-		if (node.operator !== '=')
-			throw new Error('Only simple assignments supported');
+		// support compound assignments like +=, -=, *=, /=
+		const compoundMap = {
+			'+=': 'add',
+			'-=': 'sub',
+			'*=': 'mul',
+			'/=': 'div'
+		};
 
-		// If RHS is simple literal or identifier/const we can avoid temp
-		if (node.right.type === 'Literal' && node.left.type === 'Identifier') {
-			const val = this.convertJsValueToNumber(node.right.value, 'assign-literal');
-			const name = node.left.name;
-			if (this.consts.has(name))
-				throw new Error(`Cannot assign to const ${name}`);
-			const dest = this.allocVar(name);
-			this.emit(`move ${dest} ${val}`);
+		if (node.operator === '=') {
+			// existing simple assign handling
+			const rhsReg = this.compileExpressionToReg(node.right);
+			const left = node.left;
+			if (left.type === 'Identifier') {
+				const name = left.name;
+				if (this.consts.has(name))
+					throw new Error(`Cannot assign to const ${name}`);
+				const dest = this.allocVar(name);
+				this.emit(`move ${dest} ${rhsReg}`);
+				this.freeTemp(rhsReg);
+			} else if (left.type === 'MemberExpression') {
+				const dev = this.resolveIC10Device(left);
+				if (!dev)
+					throw new Error('Unsupported member assignment - expected IC10.dN.Prop');
+				this.emit(`s ${dev.pin} ${dev.prop} ${rhsReg}`);
+				this.freeTemp(rhsReg);
+			} else {
+				throw new Error('Unsupported assignment LHS type: ' + left.type);
+			}
 			return;
 		}
-		if (node.right.type === 'Identifier' && node.left.type === 'Identifier') {
-			const srcName = node.right.name,
-			dstName = node.left.name;
-			const name = dstName;
-			if (this.consts.has(name))
-				throw new Error(`Cannot assign to const ${name}`);
-			const dest = this.allocVar(name);
-			if (this.consts.has(srcName)) {
-				this.emit(`move ${dest} ${srcName}`);
-				return;
-			}
-			if (this.varReg.has(srcName)) {
-				this.emit(`move ${dest} ${this.varReg.get(srcName)}`);
-				return;
-			}
-			// fallback to general
-		}
 
-		const rhsReg = this.compileExpressionToReg(node.right);
+		// compound assignment
+		if (!(node.operator in compoundMap))
+			throw new Error('Only simple and compound assignments supported');
+
+		const op = compoundMap[node.operator];
+
+		// Helper compile right side to one of:
+		// - immediate number or symbol string (if literal/const)
+		// - register name (rN)
+		const compileRHSAsValue = (expr) => {
+			if (expr.type === 'Literal') {
+				return this.convertJsValueToNumber(expr.value, 'assign-compound-literal');
+			}
+			if (expr.type === 'Identifier') {
+				const nm = expr.name;
+				if (this.consts.has(nm))
+					return nm;
+				if (this.varReg.has(nm))
+					return this.varReg.get(nm);
+				// identifier not declared: compile to reg (alloc)
+				return this.allocVar(nm);
+			}
+			// other cases (MemberExpression, BinaryExpression, Call, etc) -> compile to reg
+			return this.compileExpressionToReg(expr);
+		};
+
 		const left = node.left;
 		if (left.type === 'Identifier') {
 			const name = left.name;
 			if (this.consts.has(name))
 				throw new Error(`Cannot assign to const ${name}`);
 			const dest = this.allocVar(name);
-			this.emit(`move ${dest} ${rhsReg}`);
-			this.freeTemp(rhsReg);
-		} else if (left.type === 'MemberExpression') {
+
+			// compile RHS
+			const rhsVal = compileRHSAsValue(node.right);
+
+			// If RHS is an immediate (number or symbol string), emit op in-place
+			if (typeof rhsVal === 'number' || (typeof rhsVal === 'string' && !/^r\d+$/.test(rhsVal))) {
+				this.emit(`${op} ${dest} ${dest} ${rhsVal}`);
+				return;
+			}
+
+			// rhsVal is a register (maybe same as dest)
+			// prefer reusing rhsVal as temp dest if it's a temp, but we want result to live in dest var.
+			if (rhsVal === dest) {
+				// case: a += a  => add dest dest dest (safe)
+				this.emit(`${op} ${dest} ${dest} ${dest}`);
+			} else {
+				this.emit(`${op} ${dest} ${dest} ${rhsVal}`);
+				// free rhs temp if it was a temp and not equal to dest
+				if (this.isTempReg(rhsVal) && rhsVal !== dest)
+					this.freeTemp(rhsVal);
+			}
+			return;
+		}
+
+		if (left.type === 'MemberExpression') {
+			// read current property, compute, write back
 			const dev = this.resolveIC10Device(left);
 			if (!dev)
 				throw new Error('Unsupported member assignment - expected IC10.dN.Prop');
-			this.emit(`s ${dev.pin} ${dev.prop} ${rhsReg}`);
-			this.freeTemp(rhsReg);
-		} else {
-			throw new Error('Unsupported assignment LHS type: ' + left.type);
+
+			// load current value
+			const cur = this.newTemp();
+			this.emit(`l ${cur} ${dev.pin} ${dev.prop}`);
+
+			// compile RHS into immediate or reg
+			const rhsVal = compileRHSAsValue(node.right);
+
+			// choose destination for computation: prefer reusing rhs temp if it's temp,
+			// otherwise reuse cur so we can s ... dest afterward.
+			let dest = null;
+			if (typeof rhsVal === 'string' && !/^r\d+$/.test(rhsVal)) {
+				// immediate/symbol: compute into cur (cur = op cur imm)
+				dest = cur;
+				this.emit(`${op} ${dest} ${cur} ${rhsVal}`);
+				// store result
+				this.emit(`s ${dev.pin} ${dev.prop} ${dest}`);
+				// free cur temp
+				this.freeTemp(cur);
+				return;
+			}
+
+			// rhsVal is register (maybe temp)
+			const rhsIsTemp = this.isTempReg(rhsVal);
+			const curIsTemp = this.isTempReg(cur);
+
+			// prefer reusing rhsVal as dest if it's a temp (saves a temp)
+			if (rhsIsTemp) {
+				dest = rhsVal;
+				// perform dest = cur op dest  -> but op expects dest as first arg so we must move cur into dest's left operand:
+				// We want dest = cur <op> dest
+				this.emit(`${op} ${dest} ${cur} ${dest}`);
+				// store and free cur (and dest will be used to store)
+				this.emit(`s ${dev.pin} ${dev.prop} ${dest}`);
+				// free cur temp
+				this.freeTemp(cur);
+				// dest is temp holding result; free it (since stored) if it's a temp
+				if (this.isTempReg(dest))
+					this.freeTemp(dest);
+				return;
+			} else {
+				// rhsVal is a non-temp register (var or symbol's register handled earlier) or maybe same as cur (unlikely)
+				// compute into cur: cur = cur op rhsVal
+				this.emit(`${op} ${cur} ${cur} ${rhsVal}`);
+				// store result
+				this.emit(`s ${dev.pin} ${dev.prop} ${cur}`);
+				// free cur temp
+				this.freeTemp(cur);
+				// if rhsVal is a temp (shouldn't be here), free it
+				if (this.isTempReg(rhsVal))
+					this.freeTemp(rhsVal);
+				return;
+			}
 		}
+
+		throw new Error('Unsupported assignment LHS type for compound operator: ' + left.type);
 	}
 
 	// ---------------- expressions ---------------------
