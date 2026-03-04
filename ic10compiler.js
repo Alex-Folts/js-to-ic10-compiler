@@ -480,8 +480,15 @@ class IC10Compiler {
 				const name = node.name;
 				if (name === 'undefined')
 					throw new Error('undefined is not supported for IC10 conversion');
+
+				// Special JS globals -> IC10 symbols
+				if (name === 'Infinity')
+					return 'pinf';
+				if (name === 'NaN')
+					return 'nan';
+
 				if (this.consts.has(name))
-					return name; // symbol immediate
+					return name; // symbol immediate (previously defined const)
 				return this.allocVar(name);
 			}
 
@@ -628,29 +635,27 @@ class IC10Compiler {
 				const op = node.operator;
 				const arg = node.argument;
 
-				// Helper to compile an argument into either:
-				//  - a JS number (immediate), OR
-				//  - a symbol string (const name), OR
-				//  - a register name like 'r8'
+				// Helper to compile/resolve argument to number / symbol / register
 				const compileArg = (n) => {
-					if (n.type === 'Literal') {
+					if (n.type === 'Literal')
 						return this.convertJsValueToNumber(n.value, 'unary-literal');
-					}
 					if (n.type === 'Identifier') {
 						const nm = n.name;
+						// map JS globals first
+						if (nm === 'Infinity')
+							return 'pinf';
+						if (nm === 'NaN')
+							return 'nan';
 						if (this.consts.has(nm))
 							return nm; // symbol immediate
 						if (this.varReg.has(nm))
 							return this.varReg.get(nm);
-						// not declared yet — allocate var reg (fallback)
 						return this.allocVar(nm);
 					}
-					// member expression or complex -> compile to reg (may return temp)
 					return this.compileExpressionToReg(n);
 				};
 
 				if (op === '+') {
-					// numeric conversion: basically return the compiled arg as-is (fold literals)
 					const a = compileArg(arg);
 					if (typeof a === 'number') {
 						const t = this.newTemp();
@@ -670,24 +675,25 @@ class IC10Compiler {
 						return t;
 					}
 
-					// symbol const -> fold to immediate negative
-					if (typeof a === 'string' && !/^r\d+$/.test(a) && this.consts.has(a)) {
-						const val = -this.consts.get(a);
-						const t = this.newTemp();
-						this.emit(`move ${t} ${val}`);
-						return t;
+					// symbol-level handling for infinities/nan
+					if (typeof a === 'string' && !/^r\d+$/.test(a)) {
+						if (a === 'pinf')
+							return 'ninf';
+						if (a === 'ninf')
+							return 'pinf';
+						if (a === 'nan')
+							return 'nan';
+						// otherwise: a is a const symbol name — we can't fold, so emit subtraction like normal below
 					}
 
-					// a is a register (rN) or temp -> dest = 0 - a
+					// fallback: compute 0 - a (dest may reuse a if it's a temp)
 					const aIsTemp = this.isTempReg(a);
 					let dest;
-					if (aIsTemp) {
-						dest = a; // reuse temp
-					} else {
+					if (aIsTemp)
+						dest = a;
+					else
 						dest = this.newTemp();
-					}
 					this.emit(`sub ${dest} 0 ${a}`);
-					// free original temp if it wasn't reused
 					if (!aIsTemp && this.isTempReg(a))
 						this.freeTemp(a);
 					return dest;
@@ -696,22 +702,31 @@ class IC10Compiler {
 				if (op === '!') {
 					const a = compileArg(arg);
 
-					// immediate number -> fold (!0 => 1, else 0)
+					// immediate numeric folding: 0 or NaN are falsy => ! => 1; others => 0
 					if (typeof a === 'number') {
 						const t = this.newTemp();
-						this.emit(`move ${t} ${a === 0 ? 1 : 0}`);
+						const v = (a === 0 || Number.isNaN(a)) ? 1 : 0;
+						this.emit(`move ${t} ${v}`);
 						return t;
 					}
 
-					// const symbol with numeric value -> fold
-					if (typeof a === 'string' && !/^r\d+$/.test(a) && this.consts.has(a)) {
-						const tv = this.consts.get(a) === 0 ? 1 : 0;
-						const t = this.newTemp();
-						this.emit(`move ${t} ${tv}`);
-						return t;
+					// symbol-level folding:
+					if (typeof a === 'string' && !/^r\d+$/.test(a)) {
+						// NaN is falsy -> !NaN == 1; infinities are truthy -> !pinf == 0
+						if (a === 'nan') {
+							const t = this.newTemp();
+							this.emit(`move ${t} 1`);
+							return t;
+						}
+						if (a === 'pinf' || a === 'ninf') {
+							const t = this.newTemp();
+							this.emit(`move ${t} 0`);
+							return t;
+						}
+						// named const symbol: we cannot be sure at compile-time; emit seq dest a 0 (dest = (a==0)?1:0)
 					}
 
-					// otherwise produce seq dest a 0  (dest = (a == 0) ? 1 : 0)
+					// general case: dest = (a == 0) ? 1 : 0
 					const aIsTemp = this.isTempReg(a);
 					let dest;
 					if (aIsTemp)
@@ -724,7 +739,6 @@ class IC10Compiler {
 					return dest;
 				}
 
-				// unsupported unary operator
 				throw new Error('Unsupported unary operator: ' + op);
 			}
 
@@ -764,24 +778,37 @@ class IC10Compiler {
 	}
 
 	// ---------------- helpers / conversion ----------------
+	// replace the existing convertJsValueToNumber implementation with this
 	convertJsValueToNumber(value, nodeHint) {
 		if (value === null)
 			return 0;
 		const t = typeof value;
+
 		if (t === 'number') {
+			// handle special numeric values as IC10 symbols
+			if (Number.isNaN(value))
+				return 'nan';
+			if (value === Infinity)
+				return 'pinf';
+			if (value === -Infinity)
+				return 'ninf';
+
 			if (!isFinite(value))
 				throw new Error('Numeric literal not finite (IC10 requires finite numbers)');
 			return value;
 		}
+
 		if (t === 'boolean')
 			return value ? 1 : 0;
+
 		if (t === 'string') {
 			const n = parseFloat(value);
-			if (isNaN(n) || String(n) !== String(value).trim() && !/^\s*[-+]?\d+(\.\d+)?(\s*)$/.test(String(value))) {
+			if (isNaN(n) || (String(n) !== String(value).trim() && !/^\s*[-+]?\d+(\.\d+)?(\s*)$/.test(String(value)))) {
 				throw new Error(`String literal "${value}" cannot be converted to a numeric value for IC10`);
 			}
 			return n;
 		}
+
 		throw new Error(`Unsupported literal type for IC10 conversion: ${t} (node: ${nodeHint || ''})`);
 	}
 
@@ -802,25 +829,66 @@ class IC10Compiler {
 			// reuse existing conversion logic (handles booleans/null/strings -> numbers)
 			return this.convertJsValueToNumber(node.value, 'const-eval-literal');
 
+			// ---- Identifier case (replace existing Identifier branch) ----
 		case 'Identifier': {
 				const name = node.name;
+				// support JS global numeric names as IC10 symbols
+				if (name === 'Infinity')
+					return 'pinf';
+				if (name === '-Infinity')
+					return 'ninf'; // unlikely, but harmless
+				if (name === 'NaN')
+					return 'nan';
+
 				if (!this.consts.has(name))
 					throw new Error(`Const ${name} used before its declaration`);
 				return this.consts.get(name);
 			}
 
+			// ---- UnaryExpression case (replace existing UnaryExpression branch) ----
 		case 'UnaryExpression': {
 				const op = node.operator;
-				// mark to detect cycles if any Identifier inside
-				// evaluate arg
+				// evaluate argument (may return number or a symbol string like 'pinf'/'ninf'/'nan')
 				const argVal = this.evaluateConstExpression(node.argument, seen);
+
+				// If argument produced a special IC10 symbol string, handle those cases explicitly.
+				if (typeof argVal === 'string') {
+					if (argVal === 'pinf') {
+						if (op === '-')
+							return 'ninf';
+						if (op === '+')
+							return 'pinf';
+						if (op === '!')
+							return 0; // !Infinity -> false -> 0
+					}
+					if (argVal === 'ninf') {
+						if (op === '-')
+							return 'pinf';
+						if (op === '+')
+							return 'ninf';
+						if (op === '!')
+							return 0; // !-Infinity -> false -> 0
+					}
+					if (argVal === 'nan') {
+						if (op === '-')
+							return 'nan';
+						if (op === '+')
+							return 'nan';
+						if (op === '!')
+							return 1; // !NaN -> true -> 1 (NaN is falsy)
+					}
+					// If argVal is some other symbol name (user const), we can't evaluate further here.
+					throw new Error(`Cannot evaluate unary ${op} on symbol ${argVal} in const initializer`);
+				}
+
+				// argVal is numeric -> do numeric unary ops
 				switch (op) {
 				case '+':
 					return +argVal;
 				case '-':
 					return -argVal;
 				case '!':
-					return (argVal === 0 ? 1 : 0);
+					return (argVal === 0 || Number.isNaN(argVal)) ? 1 : 0;
 				default:
 					throw new Error(`Unsupported unary operator in const initializer: ${op}`);
 				}
