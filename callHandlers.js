@@ -19,7 +19,7 @@ class JsIC10CallHandlers {
 		if (arg.type === 'Literal') {
 			const num = this.convertJsValueToNumber(arg.value, 'sleep-arg');
 			this.emit(`sleep ${num}`);
-			return null;
+			return 0;//Hack to make it stop emitting extra 'move {rTmp} 0'
 		}
 		const r = this.compileExpressionToReg(arg);
 		if (typeof r === 'string' && !/^r\d+$/.test(r)) {
@@ -28,7 +28,7 @@ class JsIC10CallHandlers {
 			this.emit(`sleep ${r}`);
 			this.freeTemp(r);
 		}
-		return null;
+		return 0;
 	}
 
 	_handleYield(compiler, callNode) {
@@ -36,7 +36,7 @@ class JsIC10CallHandlers {
 		if (args.length !== 0)
 			throw new Error('IC10.yield() expects no arguments');
 		this.emit('yield');
-		return null;
+		return 0;
 	}
 
 	_handleHcf(compiler, callNode) {
@@ -44,7 +44,7 @@ class JsIC10CallHandlers {
 		if (args.length !== 0)
 			throw new Error('IC10.hcf() expects no arguments');
 		this.emit('hcf');
-		return null;
+		return 0;
 	}
 
 	_handleLerp(compiler, callNode) {
