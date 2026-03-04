@@ -164,7 +164,7 @@ class IC10Compiler {
 
 		// emit push with initializer (if provided) or push 0
 		if (initNode) {
-			// If initializer is a simple literal or const symbol, push immediate/symbol
+			// If initializer is a literal
 			if (initNode.type === 'Literal') {
 				const v = this.convertJsValueToNumber(initNode.value, `var init ${name}`);
 				this.emit(`push ${v}`);
@@ -172,11 +172,24 @@ class IC10Compiler {
 				// push const symbol
 				this.emit(`push ${initNode.name}`);
 			} else {
-				// compile general expression to reg and push it
+				// compile initializer expression to a value (may return a register, temp, symbol, or a @stkN token)
 				const src = this.compileExpressionToReg(initNode);
-				this.emit(`push ${src}`);
-				if (this.isTempReg(src))
-					this.freeTemp(src);
+
+				// If src indicates a stack-backed variable token like '@stkN', load it into a temp first
+				if (typeof src === 'string' && src.startsWith('@stk')) {
+					const addr = parseInt(src.slice(4), 10);
+					const valTemp = this.loadStackVar(addr); // returns a temp register
+					this.emit(`push ${valTemp}`);
+					// free the loaded temp
+					if (this.isTempReg(valTemp))
+						this.freeTemp(valTemp);
+				} else {
+					// src is either a register name (rN), a temp, or a symbol/number — push it directly
+					this.emit(`push ${src}`);
+					// if src is a temp register, free it (we consumed its value by pushing)
+					if (this.isTempReg(src))
+						this.freeTemp(src);
+				}
 			}
 		} else {
 			this.emit(`push 0`);
