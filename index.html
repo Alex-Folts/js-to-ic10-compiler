@@ -2,25 +2,118 @@
 <html>
 <head>
 <meta charset="utf-8" />
-<title>Esprima → IC10 (with temp reuse)</title>
+<title>Esprima → IC10 — Compiler UI</title>
+
 <style>
-  body{font-family:system-ui,Helvetica,Arial;margin:18px}
-  textarea{width:100%;height:160px;font-family:monospace}
-  pre{background:#11110f;color:#e6e6db;padding:12px;border-radius:8px;white-space:pre-wrap}
-  .row{display:flex;gap:12px}
-  .col{flex:1}
-  button{padding:8px 12px;font-size:14px}
-  small {color:#666}
+  :root{
+    --bg:#f6f7f8;
+    --panel:#fff;
+    --muted:#666;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace;
+  }
+
+  html,body{height:100%;margin:0;background:var(--bg);font-family:Inter, system-ui, Helvetica, Arial, sans-serif;color:#111}
+  /* page layout: header + main (two columns) + footer (optional) */
+  .page { display:flex; flex-direction:column; height:100vh; gap:12px; padding:14px; box-sizing:border-box; }
+  header{display:flex;align-items:center;gap:12px}
+  header h1{margin:0;font-size:18px;font-weight:600}
+  header .subtitle{color:var(--muted); font-size:13px}
+
+  /* main area stretches */
+  .main { display:flex; gap:12px; flex:1; min-height:0; } /* min-height:0 important for children flex overflow */
+
+  .col { background:var(--panel); border-radius:8px; padding:12px; box-shadow:0 1px 0 rgba(0,0,0,0.03); display:flex; flex-direction:column; min-width:0; }
+  .col h3 { margin:0 0 8px 0; font-size:14px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+
+  /* editor area must fill remaining vertical space; CodeMirror will be sized to 100% */
+  .editorWrap { display:flex; flex-direction:column; gap:8px; flex:1; min-height:0; }
+  .editorTop { display:flex; align-items:center; justify-content:space-between; gap:8px; padding-bottom:8px}
+  .leftTools { display:flex; gap:8px; align-items:center; }
+  .rightTools { display:flex; gap:8px; align-items:center; }
+
+  .editorHolder { flex:1; min-height:0; border-radius:6px; overflow:hidden; border:1px solid #e6e6e9; }
+  .outputHolder  { flex:1; min-height:0; display:flex; flex-direction:column; gap:8px; }
+
+  /* output pre-scroller */
+  .outbox { flex:1; min-height:0; overflow:auto; padding:12px; background:#0f1110; color:#e6e6db; border-radius:6px; font-size:13px; white-space:pre-wrap; }
+
+  /* buttons and inputs */
+  button { cursor:pointer; border:1px solid #a0a0a3; background:#f1f1f1; border-radius:6px; padding:8px 10px; font-size:13px; }
+  button:active{transform:translateY(1px)}
+  .small { font-size:12px; color:var(--muted) }
+
+  .linecount { font-family:var(--mono); font-size:13px; color:var(--muted); margin-right:auto; }
+
+  .status-over { color:crimson; font-weight:700; }
+
+  /* make CodeMirror fill container */
+  .CodeMirror { height:100% !important; }
+
+  /* hint/autocomplete styling (from codemirror addon) */
+  .CodeMirror-hints { font-family:inherit; font-size:13px; }
+
+  /* footer */
+  footer { font-size:12px; color:var(--muted); display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .flexrow { display:flex; gap:8px; align-items:center; }
+
+  /* responsive shrink */
+  @media (max-width:900px){
+    .main{ flex-direction:column; }
+  }
 </style>
+
+<!-- CodeMirror core -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/addon/hint/show-hint.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/javascript/javascript.min.js"></script>
+
+<!-- hint/autocomplete addons -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/addon/hint/show-hint.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/addon/hint/javascript-hint.min.js"></script>
+
+<!-- Esprima parser -->
+<script src="https://unpkg.com/esprima@4.0.1/dist/esprima.js"></script>
+
+<!-- Your compiler & handlers (assumed present) -->
+<script src="callHandlers.js"></script>
+<script src="ic10compiler.js"></script>
 </head>
 <body>
-  <h1>Esprima → IC10 (math + device I/O demo)</h1>
-  <p>Write JS using <code>IC10.d0</code>.. <code>IC10.d5</code> to access device pins. Example: <code>IC10.d0.Temperature</code> or <code>IC10.d1.On = 1</code>.</p>
+<div class="page">
 
-  <div class="row">
-    <div class="col">
-      <h3>JS source</h3>
-      <textarea id="src">
+  <header>
+    <div style="display:flex;flex-direction:column">
+      <h1>Javascript → IC10</h1>
+      <div class="subtitle">Compile a small JS subset to Stationeers IC10</div>
+    </div>
+    <div style="margin-left:auto" class="small">IC10 compiler</div>
+  </header>
+
+  <main class="main">
+    <!-- left: editor -->
+    <section class="col" style="flex:1 1 60%;">
+      <div class="editorTop">
+        <div class="leftTools">
+          <div class="toolbar">
+            <button id="compile">Compile → IC10</button>
+            <button id="save_proj">Save</button>
+            <button id="load_proj">Load</button>
+            <button id="info">Info</button>
+            <label style="display:flex;align-items:center;gap:6px;margin-left:6px;">
+              <input id="debugCheck" type="checkbox" /> <span class="small">Debug mode</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="rightTools small">
+          <span></span>
+        </div>
+      </div>
+
+      <div class="editorHolder editorWrap">
+        <textarea id="src">
 // Example: math + device read/write
 var a = 2;
 var b = 10;
@@ -29,6 +122,8 @@ var sum = a + b * 3;
 // read temperature from device on d0
 var temp = IC10.d0.Temperature;
 
+IC10.yield();
+
 // set the On property of device d1 based on condition
 if (sum > temp) {
   IC10.d1.On = 1;
@@ -36,148 +131,231 @@ if (sum > temp) {
   IC10.d1.On = 0;
 }
 
+IC10.sleep(1);
+
 // simple loop: increment a until 5
 while (a < 5) {
   a = a + 1;
-}</textarea>
-      <p>
-        <button id="compile">Compile → IC10</button>
-		<button id="save_proj">Save</button>
-		<button id="load_proj">Load</button>
-        <button id="clear">Clear output</button>
-        <button id="copy">Copy IC10 out</button>
-        <button id="open_sim">Simulator</button>
-		<input id="inp" type='file' style="visibility:hidden;" onchange="readFile(event)" />
-      </p>
-      <small>Supported subset: var/assign, literals, identifiers, binary + - * /, if, while (basic), MemberExpression IC10.dN.Prop.</small>
-    </div>
+}
+        </textarea>
+      </div>
+    </section>
 
-    <div class="col">
-      <h3>Generated IC10</h3>
-      <pre id="out">(nothing yet)</pre>
-    </div>
-  </div>
+    <!-- right: output -->
+    <section class="col" style="flex:1 1 40%;">
+      <h3 style="display:flex;align-items:center;justify-content:space-between">
+        <span>Generated IC10</span>
+        <span style="display:flex;align-items:center;gap:8px">
+          <span id="lineCount" class="linecount">0 / 128</span>
+          <div class="toolbar" style="margin-left:8px">
+            <button id="clear">Clear</button>
+            <button id="copy">Copy</button>
+            <button id="open_sim">Simulator</button>
+          </div>
+        </span>
+      </h3>
 
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/javascript/javascript.min.js"></script>
+      <div class="outputHolder">
+        <pre id="out" class="outbox">(nothing yet)</pre>
+      </div>
+    </section>
+  </main>
 
-  <script src="https://unpkg.com/esprima@4.0.1/dist/esprima.js"></script>
-  
-  <script src="callHandlers.js"></script>
-  <script src="ic10compiler.js"></script>
-  
-  <script>
-	//Utils
-	function copyTextToClipboard(text) {
-		navigator.clipboard.writeText(text).then(function () {
-			console.log('Async: Copying to clipboard was successful!');
-		}, function (err) {
-			console.error('Async: Could not copy text: ', err);
-		});
-	}
+  <footer>
+    <div class="small">Supported subset: var/const, assignments, binary/unary, if/while/for/switch, Math.*, IC10.* device reads/writes.</div>
+    <div class="small">Line limit: 128</div>
+  </footer>
+</div>
 
-	function download(filename, text) {
-		var element = document.createElement('a');
-		element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
-		element.setAttribute('download', filename);
+<!-- hidden file input for load -->
+<input id="inp" type="file" style="display:none" />
 
-		element.style.display = 'none';
-		document.body.appendChild(element);
-
-		element.click();
-
-		document.body.removeChild(element);
-	}
-
-	// turn the existing textarea into a CodeMirror editor
+<script>
+	// Initialize CodeMirror
 	const editor = CodeMirror.fromTextArea(document.getElementById('src'), {
 			mode: 'javascript',
 			lineNumbers: true,
 			tabSize: 2,
-			indentWithTabs: false
+			indentWithTabs: false,
+			extraKeys: {
+				"Ctrl-Space": "autocomplete"
+			},
+			hintOptions: {
+				completeSingle: false
+			}
 		});
 
-	// ---- UI wiring ----
+	// ensure CodeMirror fills its container height
+	function resizeEditors() {
+		const holder = document.querySelector('.editorHolder');
+		if (holder) {
+			const rect = holder.getBoundingClientRect();
+			// set height for CodeMirror
+			editor.setSize(null, rect.height + "px");
+		}
+		// ensure outbox height is correct (flex takes care of it)
+	}
+	window.addEventListener('resize', resizeEditors);
+	// initial
+	setTimeout(resizeEditors, 50);
+
+	// utils
+	function copyTextToClipboard(text) {
+		return navigator.clipboard.writeText(text);
+	}
+	function download(filename, text) {
+		const a = document.createElement('a');
+		a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
+		a.download = filename;
+		a.style.display = 'none';
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+	}
+
+	// UI elements
+	const outEl = document.getElementById('out');
+	const compileBtn = document.getElementById('compile');
+	const clearBtn = document.getElementById('clear');
+	const copyBtn = document.getElementById('copy');
+	const saveBtn = document.getElementById('save_proj');
+	const loadBtn = document.getElementById('load_proj');
+	const inp = document.getElementById('inp');
+	const simBtn = document.getElementById('open_sim');
+	const lineCountEl = document.getElementById('lineCount');
+	const debugCheck = document.getElementById('debugCheck');
+	const infoBtn = document.getElementById('info');
+
 	let compileError = false;
-	const out = document.getElementById('out');
-	document.getElementById('compile').addEventListener('click', () => {
-		//const src = document.getElementById('src').value;
+
+	function updateLineCountFromText(text) {
+		if (!text) {
+			lineCountEl.textContent = '0 / 128';
+			lineCountEl.classList.remove('status-over');
+			return;
+		}
+		const lines = text.split('\n').length;
+		lineCountEl.textContent = lines + ' / 128';
+		if (lines > 128)
+			lineCountEl.classList.add('status-over');
+		else
+			lineCountEl.classList.remove('status-over');
+	}
+
+	compileBtn.addEventListener('click', () => {
 		const src = editor.getValue();
 		compileError = false;
 		let ast;
 		try {
 			ast = esprima.parseScript(src);
-			console.log(ast);
 		} catch (e) {
-			out.textContent = 'Parse error: ' + e.message;
+			outEl.textContent = 'Parse error: ' + e.message;
 			compileError = true;
+			updateLineCountFromText('');
 			return;
 		}
-		try {
-			const c = new IC10Compiler({ debug: false });
 
-			const jsIC10CallHandlers = new JsIC10CallHandlers();
-			jsIC10CallHandlers.Register(c);
-			const jsMathCallHandlers = new JsMathCallHandlers();
-			jsMathCallHandlers.Register(c);
+		try {
+			const c = new IC10Compiler({
+					debug: !!debugCheck.checked
+				});
+
+			// register handlers (your callHandlers file should export these classes)
+			if (typeof JsIC10CallHandlers !== 'undefined') {
+				const jsIC10CallHandlers = new JsIC10CallHandlers();
+				jsIC10CallHandlers.Register(c);
+			}
+			if (typeof JsMathCallHandlers !== 'undefined') {
+				const jsMathCallHandlers = new JsMathCallHandlers();
+				jsMathCallHandlers.Register(c);
+			}
 
 			const ic = c.compileProgram(ast);
-			out.textContent = ic;
+			outEl.textContent = ic || '(empty)';
+			updateLineCountFromText(ic);
 		} catch (e) {
-			out.textContent = 'Compile error: ' + e.message;
+			outEl.textContent = 'Compile error: ' + e.message;
 			compileError = true;
+			updateLineCountFromText('');
 		}
 	});
-	document.getElementById('clear').addEventListener('click', () => out.textContent = '');
-	document.getElementById('copy').addEventListener('click', () => {
-		if (compileError) {
+
+	clearBtn.addEventListener('click', () => {
+		outEl.textContent = '';
+		updateLineCountFromText('');
+	});
+
+	copyBtn.addEventListener('click', () => {
+		if (compileError)
 			return;
-		}
-		copyTextToClipboard(out.textContent);
+		copyTextToClipboard(outEl.textContent).catch(() => { /*ignore*/
+		});
 	});
-	document.getElementById('save_proj').addEventListener('click', () => {
+
+	saveBtn.addEventListener('click', () => {
 		const src = editor.getValue();
 		const projObj = {
 			source: src
 		};
 		download('project.json', JSON.stringify(projObj));
 	});
-	document.getElementById('load_proj').addEventListener('click', () => {
-		document.getElementById('inp').click();
-		//hack
-		document.getElementById('inp').onclick = function () {
-			this.value = null;
-		};
+
+	loadBtn.addEventListener('click', () => {
+		inp.value = null;
+		inp.click();
 	});
-	function readFile(e) {
-		var file = e.target.files[0];
-		if (!file)
+
+	inp.addEventListener('change', (e) => {
+		const f = e.target.files && e.target.files[0];
+		if (!f)
 			return;
-		var reader = new FileReader();
-		reader.onload = function (e) {
-			const src = e.target.result;
-			const projObj = JSON.parse(src);
-			editor.setValue(projObj.source);
-		}
-		reader.readAsText(file)
-	}
-	document.getElementById('open_sim').addEventListener('click', () => {
-		if (compileError) {
+		const reader = new FileReader();
+		reader.onload = (ev) => {
+			try {
+				const obj = JSON.parse(ev.target.result);
+				if (obj && obj.source)
+					editor.setValue(obj.source);
+			} catch (err) {
+				alert('Failed to load project: ' + err.message);
+			}
+		};
+		reader.readAsText(f);
+	});
+
+	simBtn.addEventListener('click', () => {
+		if (compileError)
 			return;
-		}
 		const payloadObj = {
-			"program": "",
-			"registers": {"io": [{}, {}, {}, {}, {}, {}, {}],"ioConnected": [true, true, true, true, true, true, true],"internal": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],"ioSlot": [{}, {}, {}, {}, {}, {}, {}],"ioReagent": [{}, {}, {}, {}, {}, {}, {}]},
+			"program": outEl.textContent,
+			"registers": {
+				"io": [{}, {}, {}, {}, {}, {}, {}
+				],
+				"ioConnected": [true, true, true, true, true, true, true],
+				"internal": Array(18).fill(0),
+				"ioSlot": [{}, {}, {}, {}, {}, {}, {}
+				],
+				"ioReagent": [{}, {}, {}, {}, {}, {}, {}
+				]
+			},
 			"runAfterRegisterChange": false,
 			"runWithErrors": false
 		};
-		payloadObj.program = out.textContent;
 		const payload = JSON.stringify(payloadObj);
 		const urlParam = window.btoa(payload);
 		const baseUrl = "https://stationeering.com/tools/ic#";
 		window.open(baseUrl + urlParam, '_blank').focus();
 	});
-  </script>
+
+	infoBtn.addEventListener('click', () => {
+		// no-op for now; reserved for future
+		alert('Info button — reserved for future help/about text.');
+	});
+
+	// initial counter update
+	updateLineCountFromText(outEl.textContent);
+
+	// trigger initial resize after DOM paint
+	setTimeout(resizeEditors, 120);
+</script>
 </body>
 </html>
