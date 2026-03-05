@@ -353,7 +353,7 @@ class IC10Compiler {
 				const endLabel = this.newLabel('end');
 
 				const test = node.test;
-				const cmpOps = new Set(['<', '<=', '>', '>=', '==', '===', '!=']);
+				const cmpOps = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
 				if (test && test.type === 'BinaryExpression' && cmpOps.has(test.operator)) {
 					// compile left/right but avoid creating temps when possible (literal/identifier/const/MemberExpression)
 					const left = test.left;
@@ -371,7 +371,8 @@ class IC10Compiler {
 						'>=': 'blt',
 						'==': 'bne',
 						'===': 'bne',
-						'!=': 'beq'
+						'!=': 'beq',
+						'!==': 'beq'
 					}
 					[test.operator];
 
@@ -415,10 +416,51 @@ class IC10Compiler {
 				const end = this.newLabel('while_end');
 				this.breakStack.push(end);
 				this.continueStack.push(start);
+
 				this.emit(`${start}:`);
-				const condReg = this.compileExpressionToReg(node.test);
-				this.emit(`beq ${condReg} 0 ${end}`);
-				this.freeTemp(condReg);
+
+				// try optimized comparison branch (same approach as optimized If)
+				const test = node.test;
+				const cmpOps = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
+				const invMap = {
+					'<': 'bge',
+					'<=': 'bgt',
+					'>': 'ble',
+					'>=': 'blt',
+					'==': 'bne',
+					'===': 'bne',
+					'!=': 'beq',
+					'!==': 'beq'
+				};
+
+				let optimized = false;
+				if (test && test.type === 'BinaryExpression' && cmpOps.has(test.operator)) {
+					const leftVal = this._compileSimpleValueOrReg(test.left);
+					const rightVal = this._compileSimpleValueOrReg(test.right);
+					const inv = invMap[test.operator];
+					if (inv) {
+						this.emit(`${inv} ${leftVal} ${rightVal} ${end}`);
+						// free temps if produced
+						if (this.isTempReg(leftVal))
+							this.freeTemp(leftVal);
+						if (this.isTempReg(rightVal))
+							this.freeTemp(rightVal);
+						optimized = true;
+					} else {
+						// free temps if any (defensive)
+						if (this.isTempReg(leftVal))
+							this.freeTemp(leftVal);
+						if (this.isTempReg(rightVal))
+							this.freeTemp(rightVal);
+					}
+				}
+
+				if (!optimized) {
+					const condReg = this.compileExpressionToReg(node.test);
+					this.emit(`beq ${condReg} 0 ${end}`);
+					this.freeTemp(condReg);
+				}
+
 				this.compileStatement(node.body);
 				this.emit(`j ${start}`);
 				this.emit(`${end}:`);
@@ -436,6 +478,7 @@ class IC10Compiler {
 						this.freeTemp(r);
 					}
 				}
+
 				const start = this.newLabel('for_start');
 				const end = this.newLabel('for_end');
 				const updateLabel = this.newLabel('for_update');
@@ -443,11 +486,49 @@ class IC10Compiler {
 				this.continueStack.push(updateLabel);
 
 				this.emit(`${start}:`);
+
+				// optimize simple comparison test into single conditional branch
 				if (node.test) {
-					const condReg = this.compileExpressionToReg(node.test);
-					this.emit(`beq ${condReg} 0 ${end}`);
-					this.freeTemp(condReg);
+					const test = node.test;
+					const cmpOps = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
+					const invMap = {
+						'<': 'bge',
+						'<=': 'bgt',
+						'>': 'ble',
+						'>=': 'blt',
+						'==': 'bne',
+						'===': 'bne',
+						'!=': 'beq',
+						'!==': 'beq'
+					};
+
+					let optimized = false;
+					if (test.type === 'BinaryExpression' && cmpOps.has(test.operator)) {
+						const leftVal = this._compileSimpleValueOrReg(test.left);
+						const rightVal = this._compileSimpleValueOrReg(test.right);
+						const inv = invMap[test.operator];
+						if (inv) {
+							this.emit(`${inv} ${leftVal} ${rightVal} ${end}`);
+							if (this.isTempReg(leftVal))
+								this.freeTemp(leftVal);
+							if (this.isTempReg(rightVal))
+								this.freeTemp(rightVal);
+							optimized = true;
+						} else {
+							if (this.isTempReg(leftVal))
+								this.freeTemp(leftVal);
+							if (this.isTempReg(rightVal))
+								this.freeTemp(rightVal);
+						}
+					}
+
+					if (!optimized) {
+						const condReg = this.compileExpressionToReg(node.test);
+						this.emit(`beq ${condReg} 0 ${end}`);
+						this.freeTemp(condReg);
+					}
 				}
+
 				this.compileStatement(node.body);
 
 				this.emit(`${updateLabel}:`);
@@ -455,6 +536,7 @@ class IC10Compiler {
 					const upr = this.compileExpressionToReg(node.update);
 					this.freeTemp(upr);
 				}
+
 				this.emit(`j ${start}`);
 				this.emit(`${end}:`);
 				this.breakStack.pop();
@@ -479,26 +561,23 @@ class IC10Compiler {
 					const cs = node.cases[i];
 					if (cs.test === null)
 						continue;
+
+					const nextLabel = this.newLabel('sc_next');
+
+					// If literal -> emit direct branch bne disc val nextLabel (no temp)
 					if (cs.test.type === 'Literal') {
 						const val = this.convertJsValueToNumber(cs.test.value, 'switch-case-literal');
-						const tmp = this.newTemp();
-						this.emit(`seq ${tmp} ${disc} ${val}`);
-						const nextLabel = this.newLabel('sc_next');
-						this.emit(`beq ${tmp} 0 ${nextLabel}`);
+						this.emit(`bne ${disc} ${val} ${nextLabel}`);
 						this.emit(`j ${caseLabels[i]}`);
 						this.emit(`${nextLabel}:`);
-						this.freeTemp(tmp);
 					} else {
+						// general expression -> compile RHS into reg and compare directly
 						const rval = this.compileExpressionToReg(cs.test);
-						const tmp = this.newTemp();
-						this.emit(`seq ${tmp} ${disc} ${rval}`);
-						const nextLabel = this.newLabel('sc_next');
-						this.emit(`beq ${tmp} 0 ${nextLabel}`);
+						this.emit(`bne ${disc} ${rval} ${nextLabel}`);
 						this.emit(`j ${caseLabels[i]}`);
 						this.emit(`${nextLabel}:`);
-						if (this.isTempReg(rval) && rval !== tmp)
+						if (this.isTempReg(rval))
 							this.freeTemp(rval);
-						this.freeTemp(tmp);
 					}
 				}
 
@@ -1251,6 +1330,7 @@ class IC10Compiler {
 		case '===':
 			return 'seq';
 		case '!=':
+		case '!==':
 			return 'sne';
 		case '<':
 			return 'slt';
