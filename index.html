@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8" />
-<title>Esprima → IC10 — Compiler UI</title>
+<title>IC10 Compiler</title>
 
 <style>
   :root{
@@ -156,7 +156,7 @@ while (a < 5) {
       </h3>
 
       <div class="outputHolder">
-        <pre id="out" class="outbox">(nothing yet)</pre>
+        <pre id="out" class="outbox"># (nothing yet)</pre>
       </div>
     </section>
   </main>
@@ -185,6 +185,150 @@ while (a < 5) {
 			}
 		});
 
+	// ---------------------- combined autocomplete (JS + IC10) ----------------------
+	// list of IC10 virtual-lib completions
+	const IC10_COMPLETIONS = [
+		// top-level object
+		"IC10",
+		// functions / commands
+		"IC10.sleep", "IC10.yield", "IC10.hcf", "IC10.lerp", "IC10.HASH",
+		// device pins
+		"IC10.d0", "IC10.d1", "IC10.d2", "IC10.d3", "IC10.d4", "IC10.d5", "IC10.db",
+		// common device properties (examples)
+		"IC10.d0.Temperature", "IC10.d0.Pressure", "IC10.d1.On"
+	];
+
+	// helper: produce a merged hint list by invoking default JS hint, then appending our items
+	function combinedJsIc10Hint(cm, options) {
+		// call built-in JS hint first
+		let base = CodeMirror.hint.javascript(cm, options) || {
+			list: [],
+			from: cm.getCursor(),
+			to: cm.getCursor()
+		};
+
+		// compute prefix (token at cursor). Use token.string truncated to cursor
+		const cur = cm.getCursor();
+		const token = cm.getTokenAt(cur);
+		const start = token.start;
+		const prefix = token.string.slice(0, cur.ch - start);
+
+		// extend with our completions that match prefix and are not already present
+		const existingTexts = new Set(base.list.map((it) => (typeof it === 'string' ? it : (it.text || it.displayText))));
+		const extras = IC10_COMPLETIONS
+			.filter(w => {
+				if (!prefix)
+					return true; // show all if prefix empty
+				return w.toLowerCase().startsWith(prefix.toLowerCase());
+			})
+			.filter(w => !existingTexts.has(w))
+			.map(w => ({
+					text: w,
+					displayText: w
+				}));
+
+		base.list = base.list.concat(extras);
+		return base;
+	}
+
+	// show combined hint on Ctrl-Space (already configured) and also show on dot typing
+	editor.setOption('extraKeys', Object.assign({}, editor.getOption('extraKeys'), {
+			"Ctrl-Space": (cm) => CodeMirror.showHint(cm, combinedJsIc10Hint, {
+				completeSingle: false
+			})
+		}));
+
+	// show hints automatically when '.' typed
+	editor.on('keyup', (cm, evt) => {
+		// only trigger on printable '.' character
+		if (evt.key === '.') {
+			CodeMirror.showHint(cm, combinedJsIc10Hint, {
+				completeSingle: false
+			});
+		}
+	});
+
+	// ---------------------- output CodeMirror + simple ic10 mode ----------------------
+	// 1) Define a very small mode for IC10 assembly-like highlighting
+	CodeMirror.defineMode("ic10", function () {
+		const keywords = /^(move|add|sub|mul|div|mod|seq|sne|slt|sle|sgt|sge|l|s|j|beq|bne|blt|bgt|ble|bge|select|peek|poke|push|pop|define|select|max|min|atan2|abs|acos|asin|atan|cos|sin|tan|ceil|exp|floor|log|rand|round|sqrt|trunc|sleep|yield|hcf)\b/i;
+		return {
+			token: function (stream) {
+				if (stream.eatSpace())
+					return null;
+				if (stream.match(/^[A-Za-z_]\w*:/))
+					return "def"; // label:
+				if (stream.match(keywords))
+					return "keyword"; // opcodes
+				if (stream.match(/^r\d+\b/))
+					return "variable-2"; // registers
+				if (stream.match(/^d(\d|b)\b/))
+					return "variable-3"; // devices
+				if (stream.match(/^(pinf|ninf|nan)\b/i))
+					return "atom"; // special constants
+				if (stream.match(/^[A-Za-z_]\w*\d+\b/))
+					return "def"; // labels2
+				if (stream.match(/^-?\d+(\.\d+)?\b/))
+					return "number"; // numbers
+				if (stream.match(/^"([^"]*)"/) || stream.match(/^'([^']*)'/))
+					return "string"; // quoted
+				if (stream.match(/^#.*$/)) {
+					stream.skipToEnd();
+					return "comment";
+				} // comments (if you use #)
+				// anything else: advance one char
+				stream.next();
+				return null;
+			}
+		};
+	});
+
+	// 2) Replace the <pre id="out"> with a CodeMirror instance (read-only).
+	// Find the existing PRE node
+	(function createOutputCm() {
+		const outPre = document.getElementById('out');
+		if (!outPre)
+			return;
+
+		const holder = document.createElement('div');
+		holder.style.height = '100%';
+		holder.style.minHeight = '0';
+
+		// replace pre with holder
+		outPre.parentNode.replaceChild(holder, outPre);
+
+		// create CM instance inside holder
+		window.outEditor = CodeMirror(holder, {
+				value: outPre.textContent || '',
+				mode: 'ic10',
+				readOnly: 'nocursor',
+				lineNumbers: true,
+				viewportMargin: Infinity
+			});
+
+		// style the editor to match the output area
+		outEditor.getWrapperElement().style.height = '100%';
+		outEditor.getWrapperElement().style.borderRadius = '2px';
+		outEditor.getWrapperElement().classList.add('outbox');
+		outEditor.getWrapperElement().style.background = '#0f1110';
+		outEditor.getWrapperElement().style.color = '#e6e6db';
+		outEditor.getWrapperElement().style.borderRadius = '6px';
+		outEditor.getWrapperElement().style.fontSize = '15px';
+
+		// helper to set output text (and update highlight)
+		window.setOutputIC10 = function (text) {
+			outEditor.setValue(text || '');
+		};
+
+		// helper to get current output text
+		window.getOutputIC10 = function () {
+			return outEditor.getValue();
+		};
+
+		// initialize with existing text
+		setOutputIC10(outPre.textContent || '');
+	})();
+
 	// ensure CodeMirror fills its container height
 	function resizeEditors() {
 		const holder = document.querySelector('.editorHolder');
@@ -212,6 +356,9 @@ while (a < 5) {
 		a.click();
 		document.body.removeChild(a);
 	}
+	function addWarning(wtext) {
+		console.warn(wtext);
+	}
 
 	// UI elements
 	const outEl = document.getElementById('out');
@@ -236,9 +383,10 @@ while (a < 5) {
 		}
 		const lines = text.split('\n').length;
 		lineCountEl.textContent = lines + ' / 128';
-		if (lines > 128)
+		if (lines > 128) {
 			lineCountEl.classList.add('status-over');
-		else
+			addWarning("Exceeded line count for IC10 program! (" + lines + " / 128)");
+		} else
 			lineCountEl.classList.remove('status-over');
 	}
 
@@ -248,8 +396,9 @@ while (a < 5) {
 		let ast;
 		try {
 			ast = esprima.parseScript(src);
+			console.log(ast);
 		} catch (e) {
-			outEl.textContent = 'Parse error: ' + e.message;
+			setOutputIC10('# Parse error: ' + e.message);
 			compileError = true;
 			updateLineCountFromText('');
 			return;
@@ -271,24 +420,24 @@ while (a < 5) {
 			}
 
 			const ic = c.compileProgram(ast);
-			outEl.textContent = ic || '(empty)';
-			updateLineCountFromText(ic);
+			setOutputIC10(ic || '(empty)');
+			updateLineCountFromText(ic || '');
 		} catch (e) {
-			outEl.textContent = 'Compile error: ' + e.message;
+			setOutputIC10('# Compile error: ' + e.message);
 			compileError = true;
 			updateLineCountFromText('');
 		}
 	});
 
 	clearBtn.addEventListener('click', () => {
-		outEl.textContent = '';
+		setOutputIC10('');
 		updateLineCountFromText('');
 	});
 
 	copyBtn.addEventListener('click', () => {
 		if (compileError)
 			return;
-		copyTextToClipboard(outEl.textContent).catch(() => { /*ignore*/
+		copyTextToClipboard(getOutputIC10()).catch(() => { /*ignore*/
 		});
 	});
 
@@ -326,7 +475,7 @@ while (a < 5) {
 		if (compileError)
 			return;
 		const payloadObj = {
-			"program": outEl.textContent,
+			"program": "",
 			"registers": {
 				"io": [{}, {}, {}, {}, {}, {}, {}
 				],
@@ -340,6 +489,7 @@ while (a < 5) {
 			"runAfterRegisterChange": false,
 			"runWithErrors": false
 		};
+		payloadObj.program = getOutputIC10();
 		const payload = JSON.stringify(payloadObj);
 		const urlParam = window.btoa(payload);
 		const baseUrl = "https://stationeering.com/tools/ic#";
@@ -352,7 +502,7 @@ while (a < 5) {
 	});
 
 	// initial counter update
-	updateLineCountFromText(outEl.textContent);
+	updateLineCountFromText(getOutputIC10());
 
 	// trigger initial resize after DOM paint
 	setTimeout(resizeEditors, 120);
