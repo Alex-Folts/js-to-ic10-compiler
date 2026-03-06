@@ -162,8 +162,8 @@ while (a < 5) {
   </main>
 
   <footer>
-    <div class="small">Supported subset: var/const, assignments, binary/unary, if/while/for/switch, Math.*, IC10.* device reads/writes.</div>
-    <div class="small">Line limit: 128</div>
+    <div class="small"></div>
+    <div class="small">Version: 0.1.0</div>
   </footer>
 </div>
 
@@ -260,8 +260,8 @@ while (a < 5) {
 					return "def"; // label:
 				if (stream.match(keywords))
 					return "keyword"; // opcodes
-				if (stream.match(/^r\d+\b/))
-					return "variable-2"; // registers
+				if (stream.match(/^(r(\d+|a)|sp)\b/))
+					return "variable-2"; // registers(r0..r15, sp, ra)
 				if (stream.match(/^d(\d|b)\b/))
 					return "variable-3"; // devices
 				if (stream.match(/^(pinf|ninf|nan)\b/i))
@@ -291,7 +291,7 @@ while (a < 5) {
 			return;
 
 		const holder = document.createElement('div');
-		holder.style.height = '100%';
+		holder.style.height = '97%';
 		holder.style.minHeight = '0';
 
 		// replace pre with holder
@@ -303,6 +303,7 @@ while (a < 5) {
 				mode: 'ic10',
 				readOnly: 'nocursor',
 				lineNumbers: true,
+				firstLineNumber: 0, //start numbering at 0
 				viewportMargin: Infinity
 			});
 
@@ -498,10 +499,10 @@ while (a < 5) {
 		window.open(baseUrl + urlParam, '_blank').focus();
 	});
 
-	infoBtn.addEventListener('click', () => {
+/*	infoBtn.addEventListener('click', () => {
 		// no-op for now; reserved for future
 		alert('Info button — reserved for future help/about text.');
-	});
+	});*/
 
 	// initial counter update
 	updateLineCountFromText(getOutputIC10());
@@ -509,5 +510,362 @@ while (a < 5) {
 	// trigger initial resize after DOM paint
 	setTimeout(resizeEditors, 120);
 </script>
+
+<!-- ========== Info panel ========== -->
+<style>
+  /* Info panel styles */
+  .info-panel {
+    position: fixed;
+    top: 80px;
+    left: 80px;
+    width: 856px;
+    height: 624px;
+    background: #ffffff;
+    border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    z-index: 9999;
+    display: none;               /* initially hidden */
+    overflow: hidden;
+    resize: both;                /* allow resize by grabbing corner */
+    min-width: 320px;
+    min-height: 180px;
+    border: 1px solid #ddd;
+    user-select: none;
+  }
+  .info-panel.open { display:block; }
+
+  .info-panel .hdr {
+    height: 36px;
+    background: linear-gradient(180deg,#f6f7f8,#efefef);
+    border-bottom: 1px solid #e6e6e9;
+    padding: 6px 10px;
+    display:flex;
+    align-items:center;
+    gap:8px;
+    cursor: grab; /* drag handle */
+  }
+  .info-panel .hdr .title { font-weight:600; font-size:13px; color:#222; flex:1; }
+  .info-panel .hdr .controls { display:flex; gap:8px; align-items:center; }
+  .info-panel .hdr button { padding:4px 8px; font-size:12px; border-radius:6px; background:#fff; border:1px solid #ccc; cursor:pointer; }
+  .info-panel .hdr .close {
+    width:28px; height:28px; display:inline-flex; align-items:center; justify-content:center; border-radius:6px;
+    background:#f8f8f8; border:1px solid #ddd; font-weight:700;
+  }
+
+  .info-panel .body {
+    padding: 12px;
+    height: calc(100% - 36px);
+    box-sizing: border-box;
+    display:flex;
+    gap:12px;
+    min-height:0;
+  }
+
+  /* left column: controls + table of contents */
+  .info-panel .left {
+    width: 160px;
+    border-right: 1px solid #eee;
+    padding-right: 8px;
+    overflow:auto;
+    min-height:0;
+  }
+  .info-panel .left h4 { margin:0 0 8px 0; font-size:13px; }
+  .info-panel .left .toc { font-size:13px; color:#333; }
+  .info-panel .left .toc a { display:block; margin:6px 0; color:#0366d6; text-decoration:none; cursor:pointer; }
+  .info-panel .left .switch { margin-top:8px; display:flex; gap:8px; align-items:center; }
+
+  /* right column: content */
+  .info-panel .right {
+    flex:1;
+    min-height:0;
+    display:flex;
+    flex-direction:column;
+  }
+
+  .info-panel .doc {
+    flex:1;
+    overflow:auto;
+    background:#fff;
+    padding:10px;
+    border-radius:6px;
+    border:1px solid #f0f0f0;
+    font-size:13px;
+    color:#222;
+  }
+
+  .info-panel .iframeWrap {
+    flex:1;
+    border-radius:6px;
+    overflow:hidden;
+    border:1px solid #eee;
+  }
+  .info-panel .iframeWrap iframe { width:100%; height:100%; border:0; display:block; }
+
+  .info-panel .footer {
+    margin-top:8px;
+    display:flex; justify-content:space-between; align-items:center;
+    gap:8px;
+  }
+  .info-panel small { color:#666; }
+
+  /* small responsive */
+  @media (max-width:720px) {
+    .info-panel { width: 92vw; left:4vw; top:40px; height:70vh; }
+    .info-panel .left { display:none; }
+  }
+</style>
+
+<div id="infoPanel" class="info-panel" role="dialog" aria-hidden="true">
+  <div class="hdr" id="infoHdr" title="Drag to move">
+    <div class="title">IC10 — Compiler info</div>
+    <div class="controls">
+<!--      <button id="infoShowEmbedded" title="Show built-in docs">Docs</button>
+      <button id="infoShowIframe" title="Load external page (iframe)">Iframe</button>
+      <input id="infoUrl" type="text" placeholder="https://example.com or relative/path.html" style="width:260px;padding:6px;border-radius:6px;border:1px solid #ccc;font-size:12px" />
+      <button id="infoLoad" title="Load URL into iframe">Load</button> -->
+      <button class="close" id="infoClose" title="Close (Esc)">✕</button>
+    </div>
+  </div>
+
+  <div class="body">
+    <div class="left">
+      <h4>Contents</h4>
+      <div class="toc">
+        <a data-target="intro">Introduction</a>
+        <a data-target="implemented">Implemented JS features</a>
+        <a data-target="ic10lib">IC10 virtual library</a>
+        <a data-target="math">Math.* → IC10</a>
+        <a data-target="limits">Limits & lines</a>
+        <a data-target="links">Links</a>
+      </div>
+    </div>
+
+    <div class="right">
+      <div id="infoDoc" class="doc" aria-live="polite">
+        <!-- ---------- built-in HTML docs here ---------- -->
+        <h3 id="intro">Introduction</h3>
+        <p>This page describes the JS → IC10 compiler features available in this UI.</p>
+
+        <h4 id="implemented">Currently implemented JS features</h4>
+        <ul>
+          <li><code>var</code>, <code>let</code>, <code>const</code> supports only numbers; <code>true</code> and <code>false</code> get converted to 1 and 0 respectively; string values attempts to parse to a number.</li>
+          <li>Implemented flow control: <code>while</code>, <code>for</code> loops, <code>switch-case</code> statement, <code>if-else</code> statement, <code>break</code>, <code>continue</code> .</li>
+        </ul>
+
+        <h4 id="ic10lib">IC10 virtual library</h4>
+        <ul>
+          <li><code>IC10.d0</code>..<code>IC10.d5</code>, <code>IC10.db</code> device pins, e.g. <code>IC10.d1.On = 1</code>.</li>
+          <li><code>IC10.sleep(seconds)</code> — emits IC10 <code>sleep</code> instruction.</li>
+          <li><code>IC10.yield()</code> — emits IC10 <code>yield</code> instruction.</li>
+          <li><code>IC10.hcf()</code> — emits IC10 <code>hcf</code> instruction.</li>
+          <li><code>IC10.HASH(str)</code> — insert IC10 <code>HASH("str")</code>.</li>
+          <li>Extendable: register new handlers in <code>callHandlers.js</code>.</li>
+        </ul>
+
+        <h4 id="math">Math.* → IC10</h4>
+        <p>Common <code>Math.*</code> functions are translated to IC10 ops. Not all functions are exact; some are emulated (e.g. <code>cbrt</code> via Newton iterations).</p>
+        <p><code>acos</code>, <code>asin</code>, <code>atan</code> functions behave differently: in IC10 for parameter values <1> it returns 0, while in JS it return NaN.</p>
+
+        <h4 id="limits">Limits & lines</h4>
+        <p>IC10 programs are limited to <strong>128 lines</strong> by the game. The UI shows a line counter. In compact mode the compiler uses numeric jump targets to reduce line overhead.</p>
+
+        <h4 id="links">Links</h4>
+        <ul>
+          <li><a href="https://stationeers-wiki.com/IC10" target="_blank" rel="noopener">Stationeers IC10 reference</a></li>
+          <li><a href="https://stationeering.com/tools/ic" target="_blank" rel="noopener">Stationeers IC10 simple emulator(outdated a bit)</a></li>
+          <li><a href="https://ic10.dev/" target="_blank" rel="noopener">Stationeers IC10 advanced emulator(require webassembly)</a></li>
+          <li><a href="https://ic10emu.dev" target="_blank" rel="noopener">Even more advanced Stationeers IC10 emulator(require webassembly)</a></li>
+          <li><a href="https://esprima.org/" target="_blank" rel="noopener">Esprima (JS parser)</a></li>
+        </ul>
+        <!-- ---------- end built-in docs ---------- -->
+      </div>
+
+      <div id="infoIframeWrap" class="iframeWrap" style="display:none;">
+        <iframe id="infoIframe" src=""></iframe>
+      </div>
+
+      <div class="footer">
+        <div><button id="infoClose2">Close</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+	(function () {
+		const panel = document.getElementById('infoPanel');
+		const hdr = document.getElementById('infoHdr');
+		const btnOpen = document.getElementById('info'); // your UI info button
+		const btnClose = document.getElementById('infoClose');
+		const btnClose2 = document.getElementById('infoClose2');
+/*		const btnDocs = document.getElementById('infoShowEmbedded');
+		const btnIframe = document.getElementById('infoShowIframe');
+		const chkIframe = document.getElementById('infoUseIframeChk');
+		const iframeWrap = document.getElementById('infoIframeWrap');
+		const docWrap = document.getElementById('infoDoc');
+		const iframe = document.getElementById('infoIframe');
+		const urlInput = document.getElementById('infoUrl');
+		const btnLoad = document.getElementById('infoLoad');*/
+
+		// open panel
+		function openPanel() {
+			panel.classList.add('open');
+			panel.setAttribute('aria-hidden', 'false');
+			// bring to front
+			panel.style.zIndex = 9999;
+		}
+
+		// close panel
+		function closePanel() {
+			panel.classList.remove('open');
+			panel.setAttribute('aria-hidden', 'true');
+		}
+
+		// wire UI
+		if (btnOpen)
+			btnOpen.addEventListener('click', openPanel);
+		btnClose.addEventListener('click', closePanel);
+		btnClose2.addEventListener('click', closePanel);
+
+/*		// show embedded docs
+		btnDocs.addEventListener('click', () => {
+			chkIframe.checked = false;
+			iframeWrap.style.display = 'none';
+			docWrap.style.display = 'block';
+		});
+
+		// show iframe UI
+		btnIframe.addEventListener('click', () => {
+			chkIframe.checked = true;
+			iframeWrap.style.display = 'block';
+			docWrap.style.display = 'none';
+		});
+
+		// switch checkbox toggles
+		chkIframe.addEventListener('change', (e) => {
+			if (chkIframe.checked) {
+				iframeWrap.style.display = 'block';
+				docWrap.style.display = 'none';
+			} else {
+				iframeWrap.style.display = 'none';
+				docWrap.style.display = 'block';
+			}
+		});
+
+		// load url into iframe
+		btnLoad.addEventListener('click', () => {
+			const v = urlInput.value.trim();
+			if (!v) {
+				alert('Enter a URL or relative path to load in the iframe.');
+				return;
+			}
+			// simple sanity: require http(s) or relative path or file:
+			iframe.src = v;
+			chkIframe.checked = true;
+			iframeWrap.style.display = 'block';
+			docWrap.style.display = 'none';
+		});*/
+
+		// allow clicking TOC anchors to scroll to sections inside doc
+		document.querySelectorAll('#infoPanel .toc a').forEach(a => {
+			a.addEventListener('click', () => {
+				const target = a.dataset.target;
+				const el = document.getElementById(target);
+				if (el) {
+					// ensure embedded doc visible
+					/*chkIframe.checked = false;
+					iframeWrap.style.display = 'none';
+					docWrap.style.display = 'block';*/
+					el.scrollIntoView({
+						behavior: 'smooth',
+						block: 'start'
+					});
+				}
+			});
+		});
+
+		// keyboard: Esc closes
+		window.addEventListener('keydown', (ev) => {
+			if (ev.key === 'Escape' && panel.classList.contains('open')) {
+				closePanel();
+			}
+		});
+
+		// ---------------- draggable implementation ----------------
+		let dragging = false;
+		let dragOffX = 0,
+		dragOffY = 0;
+
+		hdr.addEventListener('mousedown', (ev) => {
+			// ignore if clicked on controls area buttons
+			const targetIsControl = ev.target.closest('button') || ev.target.closest('input');
+			if (targetIsControl)
+				return;
+			dragging = true;
+			hdr.style.cursor = 'grabbing';
+			const rect = panel.getBoundingClientRect();
+			dragOffX = ev.clientX - rect.left;
+			dragOffY = ev.clientY - rect.top;
+			ev.preventDefault();
+		});
+		window.addEventListener('mousemove', (ev) => {
+			if (!dragging)
+				return;
+			let nx = ev.clientX - dragOffX;
+			let ny = ev.clientY - dragOffY;
+			// clamp into viewport
+			const vw = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+			const vh = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
+			const rect = panel.getBoundingClientRect();
+			if (nx < 8)
+				nx = 8;
+			if (ny < 8)
+				ny = 8;
+			if (nx + rect.width > vw - 8)
+				nx = vw - rect.width - 8;
+			if (ny + rect.height > vh - 8)
+				ny = vh - rect.height - 8;
+			panel.style.left = nx + 'px';
+			panel.style.top = ny + 'px';
+		});
+		window.addEventListener('mouseup', () => {
+			if (dragging) {
+				dragging = false;
+				hdr.style.cursor = 'grab';
+			}
+		});
+
+		// when resized by user, ensure it stays visible: keep top/left within viewport
+		const ro = new ResizeObserver(() => {
+				const rect = panel.getBoundingClientRect();
+				const vw = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+				const vh = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
+				let changed = false;
+				let left = rect.left,
+				top = rect.top,
+				width = rect.width,
+				height = rect.height;
+				if (left + width > vw - 8) {
+					left = Math.max(8, vw - width - 8);
+					changed = true;
+				}
+				if (top + height > vh - 8) {
+					top = Math.max(8, vh - height - 8);
+					changed = true;
+				}
+				if (changed) {
+					panel.style.left = left + 'px';
+					panel.style.top = top + 'px';
+				}
+			});
+		ro.observe(panel);
+
+		// expose helpers (optional)
+		window.openInfoPanel = openPanel;
+		window.closeInfoPanel = closePanel;
+	})();
+</script>
+<!-- ========== end info panel ========== -->
+
 </body>
 </html>
