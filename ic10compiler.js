@@ -905,24 +905,66 @@ class IC10Compiler {
 			}
 
 		case 'UpdateExpression': {
+				// Only ++/-- on identifiers supported
 				if (node.argument.type !== 'Identifier')
 					throw new Error('Only simple ++/-- on identifiers supported');
+
 				const name = node.argument.name;
 				if (this.consts.has(name))
 					throw new Error(`Cannot update const ${name}`);
-				const reg = this.allocVar(name);
-				const plus = node.operator === '++' ? 'add' : (node.operator === '--' ? 'sub' : null);
-				if (!plus)
+
+				const op = node.operator === '++' ? 'add' : (node.operator === '--' ? 'sub' : null);
+				if (!op)
 					throw new Error('Unsupported update operator ' + node.operator);
-				if (node.prefix) {
-					this.emit(`${plus} ${reg} ${reg} 1`);
-					return reg;
-				} else {
-					const tmp = this.newTemp();
-					this.emit(`move ${tmp} ${reg}`);
-					this.emit(`${plus} ${reg} ${reg} 1`);
-					return tmp;
+
+				// Get variable location (may be 'rN' or '@stkN')
+				const loc = this.allocVar(name);
+
+				// Helper to do operation on a register (var reg)
+				const doRegUpdate = (reg) => {
+					if (node.prefix) {
+						// ++x  -> perform update, return reg (var reg)
+						this.emit(`${op} ${reg} ${reg} 1`);
+						return reg;
+					} else {
+						// x++ -> return old value: tmp = reg; reg = reg +/- 1; return tmp
+						const tmp = this.newTemp();
+						this.emit(`move ${tmp} ${reg}`);
+						this.emit(`${op} ${reg} ${reg} 1`);
+						return tmp;
+					}
+				};
+
+				// If loc is stack token, handle via peek/poke sequence
+				if (typeof loc === 'string' && loc.startsWith('@stk')) {
+					const addr = parseInt(loc.slice(4), 10);
+
+					// load current value into a temp (loadStackVar returns a temp)
+					const cur = this.loadStackVar(addr); // returns temp (r8..r15)
+
+					if (node.prefix) {
+						// ++x (prefix): modify cur in place, poke back, return cur (temp)
+						this.emit(`${op} ${cur} ${cur} 1`);
+						// write back to stack: poke addr cur
+						this.emit(`poke ${addr} ${cur}`);
+						// return cur (do NOT free it here — caller will free when appropriate)
+						return cur;
+					} else {
+						// x++ (postfix): return old value; perform update in cur and poke
+						const old = this.newTemp();
+						this.emit(`move ${old} ${cur}`); // old = cur
+						this.emit(`${op} ${cur} ${cur} 1`); // cur = cur +/- 1
+						this.emit(`poke ${addr} ${cur}`); // write back
+						// free the cur temp (we no longer need it)
+						if (this.isTempReg(cur))
+							this.freeTemp(cur);
+						// return the old value (temp) to caller
+						return old;
+					}
 				}
+
+				// Otherwise loc is a register like 'r0'..'r7'
+				return doRegUpdate(loc);
 			}
 
 		case 'CallExpression': {
