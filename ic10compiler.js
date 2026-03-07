@@ -27,6 +27,8 @@ class IC10Compiler {
 		// new fields in constructor
 		this.stackVars = new Map(); // name -> stackAddress (number)
 		this.nextStackAddr = 0; // next free stack slot index (0-based)
+
+		this._patternOptimizer = new IC10PatternOptimizer(); //TODO: pass it as an input parameter in constructor?
 	}
 
 	// -------------------------------------------------------------------
@@ -100,6 +102,26 @@ class IC10Compiler {
 			return;
 		if (!this.tempInUse.has(reg))
 			return;
+
+		//console.log('--- Freeing: ' + reg + ' at line: [' + this.code[this.code.length - 1] + ']');
+		if (!this.debug) {
+			// Attempt on-the-fly optimization: if the last emitted lines are
+			// "<op> reg ..." followed by "move dest reg", we can rewrite op to write to dest directly
+			// and drop the move. This saves one emitted line.
+			try {
+				// try the op->move->freeTemp rewrite first
+				this._patternOptimizer.tryOptimizeOnFree(this.code, reg);
+				// then try removing dead move copies like: "move r9 r5" that are never used
+				this._patternOptimizer.tryRemoveDeadMove(this.code, reg);
+				// Note: even if optimized, reg is no longer needed by future code,
+				// so we still mark it free/available for reuse.
+			} catch (e) {
+				// optimizer must never break compilation; log and continue
+				console.warn('Pattern optimizer error:', e);
+			}
+		}
+
+		// normal freeing
 		this.tempInUse.delete(reg);
 		this.tempPool.push(reg);
 	}
@@ -257,6 +279,14 @@ class IC10Compiler {
 		this.continueStack = [];
 
 		this.traverseStatements(ast.body);
+
+		// ----------------- pruning passes -----------------
+		// Remove instructions that are known unreachable after unconditional jumps.
+		this._removeUnreachableAfterUncondJump();
+
+		// Remove label declarations that have no incoming references (orphan labels).
+		this._removeOrphanLabels();
+		// ------------------------------------------------------
 
 		// finalize code: either keep labeled debug form or compact numeric form
 		if (this.debug) {
@@ -811,9 +841,10 @@ class IC10Compiler {
 		switch (node.type) {
 		case 'Literal': {
 				const converted = this.convertJsValueToNumber(node.value, 'literal');
-				const t = this.newTemp();
-				this.emit(`move ${t} ${converted}`);
-				return t;
+				//const t = this.newTemp();
+				//this.emit(`move ${t} ${converted}`);
+				//return t;
+				return converted; //if its just number - we return number's value?
 			}
 
 		case 'Identifier': {
@@ -1070,9 +1101,10 @@ class IC10Compiler {
 
 					// immediate number -> fold
 					if (typeof a === 'number') {
-						const t = this.newTemp();
-						this.emit(`move ${t} ${-a}`);
-						return t;
+						//const t = this.newTemp();
+						//this.emit(`move ${t} ${-a}`);
+						//return t;
+						return -a;//return negated number's value?
 					}
 
 					// symbol-level handling for infinities/nan
@@ -1188,7 +1220,6 @@ class IC10Compiler {
 	}
 
 	// ---------------- helpers / conversion ----------------
-	// replace the existing convertJsValueToNumber implementation with this
 	convertJsValueToNumber(value, nodeHint) {
 		if (value === null)
 			return 0;
@@ -1462,6 +1493,105 @@ class IC10Compiler {
 		// Prepend preamble (if any)
 		const pre = this.preamble.length ? (this.preamble.join('\n') + '\n') : '';
 		return pre + replaced.join('\n');
+	}
+
+	// remove instructions that are unreachable because an unconditional 'j' preceded them
+	_removeUnreachableAfterUncondJump() {
+		if (!Array.isArray(this.code) || this.code.length === 0)
+			return;
+
+		const isLabel = (ln) => /^[A-Za-z_]\w*:\s*$/.test((ln || '').trim());
+		const isBlank = (ln) => /^\s*$/.test((ln || '').trim());
+
+		const out = [];
+		for (let i = 0; i < this.code.length; i++) {
+			const line = this.code[i];
+			const tl = (line || '').trim();
+
+			// always keep label lines
+			if (isLabel(tl) || isBlank(tl)) {
+				out.push(line);
+				continue;
+			}
+
+			// if this is an unconditional jump, keep it and skip following non-label lines
+			// We consider 'j' as unconditional jump opcode (token at beginning)
+			const parts = tl.split(/\s+/).filter(Boolean);
+			const op = parts[0] ? parts[0].toLowerCase() : '';
+			if (op === 'j') {
+				out.push(line);
+				// skip until next label (but keep labels)
+				let j = i + 1;
+				for (; j < this.code.length; j++) {
+					const next = this.code[j];
+					const nt = (next || '').trim();
+					if (isLabel(nt)) {
+						// stop skipping and allow loop to process this label next iteration
+						break;
+					}
+					// otherwise skip the instruction (it's unreachable)
+				}
+				i = j - 1; // outer loop will increment i -> j
+				continue;
+			}
+
+			// not an unconditional jump or label: keep normally
+			out.push(line);
+		}
+
+		this.code = out;
+	}
+
+	// remove labels that are not referenced by any jump/branch in the current code
+	_removeOrphanLabels() {
+		if (!Array.isArray(this.code) || this.code.length === 0)
+			return;
+
+		// collect declared labels and build a map label->index
+		const labelDeclRegex = /^([A-Za-z_]\w*):\s*$/;
+		const declared = new Set();
+		for (const ln of this.code) {
+			const m = (ln || '').trim().match(labelDeclRegex);
+			if (m)
+				declared.add(m[1]);
+		}
+		if (declared.size === 0)
+			return;
+
+		// find referenced labels from jump-like ops
+		const jumpOpNames = new Set(['j', 'beq', 'bne', 'blt', 'bgt', 'ble', 'bge']);
+		const referenced = new Set();
+		for (const ln of this.code) {
+			const tl = (ln || '').trim();
+			if (!tl)
+				continue;
+			const parts = tl.split(/\s+/).filter(Boolean);
+			if (parts.length < 2)
+				continue;
+			const op = parts[0].toLowerCase();
+			if (jumpOpNames.has(op)) {
+				const target = parts[parts.length - 1];
+				// only add if it looks like a label name (not numeric after finalize)
+				if (/^[A-Za-z_]\w*$/.test(target))
+					referenced.add(target);
+			}
+		}
+
+		// remove any declared labels that aren't referenced
+		if (referenced.size === 0) {
+			// none referenced -> remove all labels
+			this.code = this.code.filter(ln => !labelDeclRegex.test((ln || '').trim()));
+			return;
+		}
+
+		// filter out unused label lines
+		this.code = this.code.filter(ln => {
+				const m = (ln || '').trim().match(labelDeclRegex);
+				if (!m)
+					return true;
+				const lbl = m[1];
+				return referenced.has(lbl);
+			});
 	}
 }
 // ---------- end IC10Compiler ----------
