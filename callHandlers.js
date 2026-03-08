@@ -19,7 +19,7 @@ class JsIC10CallHandlers {
 		if (arg.type === 'Literal') {
 			const num = this.convertJsValueToNumber(arg.value, 'sleep-arg');
 			this.emit(`sleep ${num}`);
-			return 0;//Hack to make it stop emitting extra 'move {rTmp} 0'
+			return 0; //Hack to make it stop emitting extra 'move {rTmp} 0'
 		}
 		const r = this.compileExpressionToReg(arg);
 		if (typeof r === 'string' && !/^r\d+$/.test(r)) {
@@ -570,28 +570,199 @@ class JsMathCallHandlers {
 		return current;
 	}
 
+	/*	_handlePow(compiler, callNode) {
+	const args = callNode.arguments || [];
+	if (args.length !== 2)
+	throw new Error('Math.pow(x) expects 2 arguments');
+	// compile both args (can be literal, const symbol or reg)
+	const compiled = [];
+	for (let i = 0; i < 2; i++) {
+	const a = args[i];
+	if (a.type === 'Literal') {
+	compiled.push(this.convertJsValueToNumber(a.value, `pow-arg${i}`));
+	} else {
+	const r = this.compileExpressionToReg(a);
+	compiled.push(r);
+	}
+	}
+	// ensure we use registers/symbols correctly - allocate dest temp
+	const dest = this.newTemp();
+	this.emit(`pow ${dest} ${compiled[0]} ${compiled[1]}`);
+	// free temps for arg registers (if they were temps)
+	for (const arg of compiled)
+	if (this.isTempReg(arg))
+	this.freeTemp(arg);
+	return dest;
+	}*/
+
 	_handlePow(compiler, callNode) {
 		const args = callNode.arguments || [];
 		if (args.length !== 2)
-			throw new Error('Math.pow(x) expects 2 arguments');
-		// compile both args (can be literal, const symbol or reg)
-		const compiled = [];
-		for (let i = 0; i < 2; i++) {
-			const a = args[i];
-			if (a.type === 'Literal') {
-				compiled.push(this.convertJsValueToNumber(a.value, `pow-arg${i}`));
-			} else {
-				const r = this.compileExpressionToReg(a);
-				compiled.push(r);
-			}
+			throw new Error('Math.pow(x, y) expects 2 arguments');
+
+		const compileArg = (a, hint) => {
+			if (a.type === 'Literal')
+				return this.convertJsValueToNumber(a.value, hint);
+			return this.compileExpressionToReg(a);
+		};
+
+		const aArg = args[0];
+		const bArg = args[1];
+
+		const aVal = compileArg(aArg, 'pow-arg0'); // base
+		const bVal = compileArg(bArg, 'pow-arg1'); // exponent
+
+		// If both folded to immediate numbers -> fold at compile time
+		if (typeof aVal === 'number' && typeof bVal === 'number') {
+			const folded = Math.pow(aVal, bVal);
+			const t = this.newTemp();
+			this.emit(`move ${t} ${folded}`);
+			return t;
 		}
-		// ensure we use registers/symbols correctly - allocate dest temp
+
+		// Helper to release arg temps after we used them
+		const freeIfTemp = (v) => {
+			if (this.isTempReg(v))
+				this.freeTemp(v);
+		};
+
+		// If exponent is a numeric literal integer -> build static sequence via
+		// exponentiation by squaring (no runtime loop)
+		if (typeof bVal === 'number' && Number.isFinite(bVal) && Number.isInteger(bVal)) {
+			const expInt = bVal;
+			// Special trivial cases
+			if (expInt === 0) {
+				// x^0 === 1 (JS: Math.pow(0,0) === 1)
+				if (typeof aVal === 'number') {
+					const t = this.newTemp();
+					this.emit(`move ${t} 1`);
+					return t;
+				} else {
+					const t = this.newTemp();
+					this.emit(`move ${t} 1`);
+					// free base if temp
+					freeIfTemp(aVal);
+					return t;
+				}
+			}
+			if (expInt === 1) {
+				// x^1 === x
+				if (typeof aVal === 'number') {
+					const t = this.newTemp();
+					this.emit(`move ${t} ${aVal}`);
+					return t;
+				}
+				// return register/symbol as-is (caller expects reg or symbol)
+				// but ensure we return a temp when caller expects a temp: we return the raw value
+				return aVal;
+			}
+
+			// For other integer exponents, perform exponentiation by squaring at compile time
+			let neg = false;
+			let e = expInt;
+			if (e < 0) {
+				neg = true;
+				e = -e;
+			}
+
+			// Ensure base is in a temp register we can square/manipulate
+			let baseReg;
+			let baseOwnsTemp = false;
+			if (typeof aVal === 'number' || (typeof aVal === 'string' && !/^r\d+$/.test(aVal))) {
+				// immediate symbol or number => move into temp
+				baseReg = this.newTemp();
+				this.emit(`move ${baseReg} ${aVal}`);
+				baseOwnsTemp = true;
+			} else {
+				// aVal is a register (var or temp). If it's a temp we can use it in-place,
+				// otherwise copy into a temp to avoid clobbering user var register.
+				if (this.isTempReg(aVal)) {
+					baseReg = aVal;
+					baseOwnsTemp = true;
+				} else {
+					baseReg = this.newTemp();
+					this.emit(`move ${baseReg} ${aVal}`);
+					baseOwnsTemp = true;
+				}
+			}
+
+			// result temp initialized to 1
+			const result = this.newTemp();
+			this.emit(`move ${result} 1`);
+
+			// exponentiation by squaring using emitted muls (no loops)
+			let curPow = baseReg; // will be squared in place
+			let curPowIsOwn = baseOwnsTemp; // curPow is a temp we can overwrite
+			let localE = e;
+			// We need an auxiliary temp if we must square curPow but curPow is also needed for result multiply
+			// However squaring in-place is fine: mul curPow curPow curPow
+			// when we need to multiply result *= curPow we can emit mul result result curPow
+			while (localE > 0) {
+				if (localE & 1) {
+					// result = result * curPow
+					this.emit(`mul ${result} ${result} ${curPow}`);
+				}
+				localE = Math.floor(localE / 2);
+				if (localE > 0) {
+					// curPow = curPow * curPow  (square it)
+					this.emit(`mul ${curPow} ${curPow} ${curPow}`);
+				}
+			}
+
+			// If negative exponent -> result = 1 / result
+			if (neg) {
+				// reuse result as dest: div result 1 result -> result = 1 / result
+				this.emit(`div ${result} 1 ${result}`);
+			}
+
+			// cleanup: free base temp if we created it and it is not the same as result
+			if (baseOwnsTemp && baseReg !== result && this.isTempReg(baseReg))
+				this.freeTemp(baseReg);
+
+			// free exponent if it was a temp
+			freeIfTemp(bVal);
+
+			return result;
+		}
+
+		// General case: use identity pow(a,b) = exp(b * log(a))
+		// We'll emit: tmpLog = log(base); tmpMul = mul tmpLog tmpLog exponent (or reuse tmpLog)
+		// then dest = exp tmpMul
+		// Ensure base/exponent are available as regs or immediates.
+		let baseReg2 = aVal;
+		let baseMoved = false;
+		if (typeof aVal === 'number' || (typeof aVal === 'string' && !/^r\d+$/.test(aVal))) {
+			baseReg2 = this.newTemp();
+			this.emit(`move ${baseReg2} ${aVal}`);
+			baseMoved = true;
+		}
+
+		let expReg2 = bVal;
+		let expMoved = false;
+		if (typeof bVal === 'number' || (typeof bVal === 'string' && !/^r\d+$/.test(bVal))) {
+			expReg2 = this.newTemp();
+			this.emit(`move ${expReg2} ${bVal}`);
+			expMoved = true;
+		}
+
+		const tmp = this.newTemp();
+		this.emit(`log ${tmp} ${baseReg2}`); // tmp = log(base)
+		this.emit(`mul ${tmp} ${tmp} ${expReg2}`); // tmp = tmp * exponent
 		const dest = this.newTemp();
-		this.emit(`pow ${dest} ${compiled[0]} ${compiled[1]}`);
-		// free temps for arg registers (if they were temps)
-		for (const arg of compiled)
-			if (this.isTempReg(arg))
-				this.freeTemp(arg);
+		this.emit(`exp ${dest} ${tmp}`); // dest = exp(tmp)
+
+		// cleanup
+		if (baseMoved && this.isTempReg(baseReg2))
+			this.freeTemp(baseReg2);
+		if (expMoved && this.isTempReg(expReg2))
+			this.freeTemp(expReg2);
+		if (this.isTempReg(tmp))
+			this.freeTemp(tmp); // tmp no longer needed (dest holds result)
+
+		// free original compiled args if they are temps (we consumed them by copying earlier)
+		freeIfTemp(aVal);
+		freeIfTemp(bVal);
+
 		return dest;
 	}
 
