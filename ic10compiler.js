@@ -1184,6 +1184,143 @@ class IC10Compiler {
 				throw new Error('Unsupported unary operator: ' + op);
 			}
 
+		case 'LogicalExpression': {
+				const op = node.operator; // '&&' or '||'
+				if (op !== '&&' && op !== '||')
+					throw new Error('Unsupported logical operator: ' + op);
+
+				// Compile left side first (may return number, symbol name, or rN)
+				const leftVal = this.compileExpressionToReg(node.left);
+
+				// Helper to compile right and return its reg/symbol/number
+				const compileRight = () => {
+					return this.compileExpressionToReg(node.right);
+				};
+
+				// If left is immediate number -> we can fold at compile time
+				if (typeof leftVal === 'number') {
+					if (op === '&&') {
+						// if left is falsy (0) -> return 0; else return right
+						if (leftVal === 0)
+							return 0;
+						const rv = compileRight();
+						// if rv is temp, return it; otherwise move into temp for uniformity
+						if (this.isTempReg(rv))
+							return rv;
+						if (typeof rv === 'number' || (typeof rv === 'string' && !/^r\d+$/.test(rv))) {
+							const t = this.newTemp();
+							this.emit(`move ${t} ${rv}`);
+							return t;
+						}
+						return rv;
+					} else { // '||'
+						// if left is truthy -> return left (non-zero), else return right
+						if (leftVal !== 0)
+							return leftVal;
+						const rv = compileRight();
+						if (this.isTempReg(rv))
+							return rv;
+						if (typeof rv === 'number' || (typeof rv === 'string' && !/^r\d+$/.test(rv))) {
+							const t = this.newTemp();
+							this.emit(`move ${t} ${rv}`);
+							return t;
+						}
+						return rv;
+					}
+				}
+
+				// leftVal is a symbol or register. We'll generate runtime test.
+				const leftIsTemp = this.isTempReg(leftVal);
+				const testTmp = this.newTemp();
+				const falseLabel = this.newLabel(op === '&&' ? 'land_false' : 'lor_false');
+				const endLabel = this.newLabel(op === '&&' ? 'land_end' : 'lor_end');
+
+				// seq testTmp leftVal 0  -> testTmp == 1 when left == 0
+				this.emit(`seq ${testTmp} ${leftVal} 0`);
+				if (op === '&&') {
+					// if left == 0 -> falseLabel (result should be 0)
+					this.emit(`beq ${testTmp} 1 ${falseLabel}`);
+					// left truthy -> evaluate right
+					// free testTmp now (no longer needed)
+					this.freeTemp(testTmp);
+
+					const rightRegOrVal = compileRight();
+
+					// choose dest: if right is temp, reuse it; else allocate a temp and move
+					let dest;
+					if (this.isTempReg(rightRegOrVal)) {
+						dest = rightRegOrVal;
+					} else {
+						dest = this.newTemp();
+						this.emit(`move ${dest} ${rightRegOrVal}`);
+					}
+
+					this.emit(`j ${endLabel}`);
+					this.emit(`${falseLabel}:`);
+					// false case -> result 0
+					// if dest not allocated yet, allocate one to be consistent
+					const zeroHolder = (typeof dest !== 'undefined') ? dest : this.newTemp();
+					this.emit(`move ${zeroHolder} 0`);
+					// If dest was not previously set, set it now
+					if (typeof dest === 'undefined')
+						dest = zeroHolder;
+
+					this.emit(`${endLabel}:`);
+
+					// cleanup: free leftVal if it was a temp
+					if (leftIsTemp)
+						this.freeTemp(leftVal);
+
+					return dest;
+				} else { // op === '||'
+					// for OR: if left != 0 -> truthy -> keep left, else evaluate right
+					// seq testTmp leftVal 0 -> 1 when left == 0
+					// we branch to evaluate right when testTmp == 1
+					this.emit(`beq ${testTmp} 1 ${falseLabel}`);
+					// left is truthy path: we want to return left as result
+					// allocate dest: if left is temp reuse it, else if left is symbol move into temp
+					let destForLeft;
+					if (leftIsTemp) {
+						destForLeft = leftVal;
+					} else if (typeof leftVal === 'string') {
+						// symbol or var register; if it's a var register (rN) we can return it directly
+						if (/^r\d+$/.test(leftVal)) {
+							destForLeft = leftVal;
+						} else {
+							// symbol: move into temp so we have a consistent return register
+							destForLeft = this.newTemp();
+							this.emit(`move ${destForLeft} ${leftVal}`);
+						}
+					} else {
+						// should not happen, but fallback
+						destForLeft = this.newTemp();
+						this.emit(`move ${destForLeft} ${leftVal}`);
+					}
+					this.emit(`j ${endLabel}`);
+
+					// falseLabel -> left was falsy -> evaluate right and return it
+					this.emit(`${falseLabel}:`);
+					this.freeTemp(testTmp);
+					const rightVal = compileRight();
+
+					let dest;
+					if (this.isTempReg(rightVal)) {
+						dest = rightVal;
+					} else {
+						dest = this.newTemp();
+						this.emit(`move ${dest} ${rightVal}`);
+					}
+
+					this.emit(`${endLabel}:`);
+
+					// cleanup: if left was temp and we didn't reuse it (i.e. dest !== leftVal), free it
+					if (leftIsTemp && dest !== leftVal)
+						this.freeTemp(leftVal);
+
+					return dest;
+				}
+			}
+
 		case 'ArrayExpression':
 		case 'ObjectExpression':
 		case 'FunctionExpression':
