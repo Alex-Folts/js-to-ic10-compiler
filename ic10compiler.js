@@ -500,10 +500,15 @@ class IC10Compiler {
 			}
 
 		case 'ForStatement': {
+				// init: can be VariableDeclaration | AssignmentExpression | expression
 				if (node.init) {
 					if (node.init.type === 'VariableDeclaration') {
 						this.compileStatement(node.init);
+					} else if (node.init.type === 'AssignmentExpression') {
+						// handle assignment in init (e.g. for (k = 1; ...))
+						this.compileAssignment(node.init);
 					} else {
+						// other expressions (e.g. function calls)
 						const r = this.compileExpressionToReg(node.init);
 						this.freeTemp(r);
 					}
@@ -563,8 +568,13 @@ class IC10Compiler {
 
 				this.emit(`${updateLabel}:`);
 				if (node.update) {
-					const upr = this.compileExpressionToReg(node.update);
-					this.freeTemp(upr);
+					if (node.update.type === 'AssignmentExpression') {
+						// handle assignment in update (e.g. for (...; ...; k = k + 1))
+						this.compileAssignment(node.update);
+					} else {
+						const upr = this.compileExpressionToReg(node.update);
+						this.freeTemp(upr);
+					}
 				}
 
 				this.emit(`j ${start}`);
@@ -1104,7 +1114,7 @@ class IC10Compiler {
 						//const t = this.newTemp();
 						//this.emit(`move ${t} ${-a}`);
 						//return t;
-						return -a;//return negated number's value?
+						return -a; //return negated number's value?
 					}
 
 					// symbol-level handling for infinities/nan
