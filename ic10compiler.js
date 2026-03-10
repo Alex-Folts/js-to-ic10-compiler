@@ -1110,26 +1110,65 @@ class IC10Compiler {
 					if (args.length > this.argRegs.length)
 						throw new Error(`Function ${fnName} supports up to ${this.argRegs.length} arguments`);
 
-					// evaluate args and move into arg registers (r12..)
-					const argRegsUsed = [];
+					// --- caller-save: figure which r0..r7 are currently used for variables ---
+					const usedRegs = []; // array of register numbers (integers) in ascending order
+					for (const[, reg]of this.varReg.entries()) {
+						const m = /^r(\d+)$/.exec(reg);
+						if (m) {
+							const rn = Number(m[1]);
+							if (rn >= 0 && rn <= 7) {
+								if (!usedRegs.includes(rn))
+									usedRegs.push(rn);
+							}
+						}
+					}
+					usedRegs.sort((a, b) => a - b);
+
+					// --- evaluate args and place them into arg registers (r12..r15) ---
 					for (let i = 0; i < args.length; i++) {
 						const a = args[i];
-						const v = (a.type === 'Literal') ? this.convertJsValueToNumber(a.value, `call-arg${i}`) : this.compileExpressionToReg(a);
+						let val;
+						if (a.type === 'Literal') {
+							val = this.convertJsValueToNumber(a.value, `call-arg${i}`);
+						} else {
+							val = this.compileExpressionToReg(a);
+						}
 						const targ = this.argRegs[i];
-						this.emit(`move ${targ} ${v}`);
-						// if v was a temp register, free it
-						if (this.isTempReg(v))
-							this.freeTemp(v);
-						argRegsUsed.push(targ);
+						this.emit(`move ${targ} ${val}`);
+						if (this.isTempReg(val))
+							this.freeTemp(val);
 					}
 
-					// call
+					// If any regs used, allocate a temp to stage moves then push them.
+					let saver = null;
+					if (usedRegs.length > 0) {
+						saver = this.newTemp(); // uses r8..r15
+						for (const rn of usedRegs) {
+							this.emit(`move ${saver} r${rn}`);
+							this.emit(`push ${saver}`);
+						}
+						// we keep saver reserved until restore
+					}
+
+					// --- call ---
 					const label = this._functionLabels.get(fnName) || `fn_${fnName}`;
 					this.emit(`jal ${label}`);
 
-					// retrieve result into a temp and return it
+					// --- return value handling (return in r1) ---
 					const retT = this.newTemp();
 					this.emit(`move ${retT} r1`);
+
+					// --- restore saved registers (pop in reverse order) ---
+					if (usedRegs.length > 0) {
+						// pop values into saver then move into registers (reverse order of pushes)
+						for (let i = usedRegs.length - 1; i >= 0; i--) {
+							const rn = usedRegs[i];
+							this.emit(`pop ${saver}`);
+							this.emit(`move r${rn} ${saver}`);
+						}
+						this.freeTemp(saver);
+					}
+
 					return retT;
 				}
 
