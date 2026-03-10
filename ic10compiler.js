@@ -9,6 +9,11 @@ class IC10Compiler {
 		this.nextTempReg = 8; // r8..r15 for temps
 		this.maxReg = 15;
 
+		this.functions = new Map(); // name -> { node, label }
+		this._functionLabels = new Map(); // name -> label
+		this.argRegs = ['r12', 'r13', 'r14', 'r15']; // registers used for args (max 4)
+		this._inFunction = null; // name of function currently compiling (or null)
+
 		this.tempPool = [];
 		this.tempInUse = new Set();
 
@@ -279,6 +284,18 @@ class IC10Compiler {
 		this.continueStack = [];
 
 		this.traverseStatements(ast.body);
+
+		if (this.functions.size > 0) {
+			this.emit(`j bypass_hack`); //we jump after last line to prevent program execute body of functions which will be placed at the tail of the program
+
+			// compile hoisted functions (in insertion order)
+			for (const[fnName, fnNode]of this.functions.entries()) {
+				const label = this._functionLabels.get(fnName);
+				this._compileFunctionDeclaration(fnNode, label, fnName);
+			}
+
+			this.emit(`bypass_hack:`); //redirect bypass jump to next line after functions declaration block
+		}
 
 		// ----------------- pruning passes -----------------
 		// Remove instructions that are known unreachable after unconditional jumps.
@@ -656,6 +673,42 @@ class IC10Compiler {
 				break;
 			}
 
+		case 'ReturnStatement': {
+				if (!this._inFunction)
+					throw new Error('return must be inside a function');
+				if (node.argument) {
+					const r = this.compileExpressionToReg(node.argument);
+					// move into r1 (caller's expectation)
+					if (typeof r === 'number' || (typeof r === 'string' && !/^r\d+$/.test(r))) {
+						// immediate / symbol
+						this.emit(`move r1 ${r}`);
+					} else {
+						// register (temp or var reg)
+						this.emit(`move r1 ${r}`);
+						if (this.isTempReg(r))
+							this.freeTemp(r);
+					}
+				} else {
+					this.emit(`move r1 0`);
+				}
+				// return using ra
+				this.emit(`j ra`);
+				break;
+			}
+
+		case 'FunctionDeclaration': {
+				// Hoist: register function and don't emit body now
+				const fnName = node.id && node.id.name;
+				if (!fnName)
+					throw new Error('Unnamed function declaration not supported');
+				const label = `fn_${fnName}`;
+				// store AST node and label for later compilation
+				this.functions.set(fnName, node);
+				this._functionLabels.set(fnName, label);
+				// don't emit anything now (hoisted)
+				break;
+			}
+
 		default:
 			throw new Error('Unhandled statement type: ' + node.type);
 		}
@@ -1009,42 +1062,78 @@ class IC10Compiler {
 			}
 
 		case 'CallExpression': {
-				const callee = node.callee;
-				if (callee.type !== 'MemberExpression')
-					throw new Error('Only namespaced CallExpressions supported');
-				const funcName = (callee.property.type === 'Identifier') ? callee.property.name
-				 : (callee.property.type === 'Literal' ? String(callee.property.value) : null);
-				if (!funcName)
-					throw new Error('Unsupported call property type');
-				let nsParts = [];
-				let cur = callee.object;
-				while (cur) {
-					if (cur.type === 'Identifier') {
-						nsParts.unshift(cur.name);
+				// If namespaced MemberExpression (IC10.*, Math.* etc.)
+				if (node.callee.type === 'MemberExpression') {
+					const callee = node.callee;
+					const funcName = (callee.property.type === 'Identifier') ? callee.property.name
+					 : (callee.property.type === 'Literal' ? String(callee.property.value) : null);
+					if (!funcName)
+						throw new Error('Unsupported call property type');
+					let nsParts = [];
+					let cur = callee.object;
+					while (cur) {
+						if (cur.type === 'Identifier') {
+							nsParts.unshift(cur.name);
+							break;
+						}
+						if (cur.type === 'MemberExpression') {
+							const prop = (cur.property.type === 'Identifier') ? cur.property.name
+							 : (cur.property.type === 'Literal' ? String(cur.property.value) : null);
+							if (prop === null)
+								break;
+							nsParts.unshift(prop);
+							cur = cur.object;
+							continue;
+						}
 						break;
 					}
-					if (cur.type === 'MemberExpression') {
-						const prop = (cur.property.type === 'Identifier') ? cur.property.name
-						 : (cur.property.type === 'Literal' ? String(cur.property.value) : null);
-						if (prop === null)
-							break;
-						nsParts.unshift(prop);
-						cur = cur.object;
-						continue;
+					const namespace = nsParts.join('.');
+					const handler = this._findHandlerFor(namespace, funcName);
+					if (!handler)
+						throw new Error(`IC function ${namespace}.${funcName} not implemented`);
+					const result = handler(this, node);
+					if (result == null) {
+						const t = this.newTemp();
+						this.emit(`move ${t} 0`);
+						return t;
 					}
-					break;
+					return result;
 				}
-				const namespace = nsParts.join('.');
-				const handler = this._findHandlerFor(namespace, funcName);
-				if (!handler)
-					throw new Error(`IC function ${namespace}.${funcName} not implemented`);
-				const result = handler(this, node);
-				if (result == null) {
-					const t = this.newTemp();
-					this.emit(`move ${t} 0`);
-					return t;
+
+				// simple identifier calls: user-defined functions
+				if (node.callee.type === 'Identifier') {
+					const fnName = node.callee.name;
+					if (!this.functions.has(fnName))
+						throw new Error(`Function ${fnName} not found`);
+
+					const args = node.arguments || [];
+					if (args.length > this.argRegs.length)
+						throw new Error(`Function ${fnName} supports up to ${this.argRegs.length} arguments`);
+
+					// evaluate args and move into arg registers (r12..)
+					const argRegsUsed = [];
+					for (let i = 0; i < args.length; i++) {
+						const a = args[i];
+						const v = (a.type === 'Literal') ? this.convertJsValueToNumber(a.value, `call-arg${i}`) : this.compileExpressionToReg(a);
+						const targ = this.argRegs[i];
+						this.emit(`move ${targ} ${v}`);
+						// if v was a temp register, free it
+						if (this.isTempReg(v))
+							this.freeTemp(v);
+						argRegsUsed.push(targ);
+					}
+
+					// call
+					const label = this._functionLabels.get(fnName) || `fn_${fnName}`;
+					this.emit(`jal ${label}`);
+
+					// retrieve result into a temp and return it
+					const retT = this.newTemp();
+					this.emit(`move ${retT} r1`);
+					return retT;
 				}
-				return result;
+
+				throw new Error('Only namespaced calls and simple identifier function calls are supported');
 			}
 
 		case 'ConditionalExpression': {
@@ -1366,6 +1455,64 @@ class IC10Compiler {
 		return this.compileExpressionToReg(node);
 	}
 
+	_compileFunctionDeclaration(fnNode, label, fnName) {
+		// snapshot caller state
+		const savedVarReg = this.varReg;
+		const savedNextVarReg = this.nextVarReg;
+		const savedNextTempReg = this.nextTempReg;
+		const savedTempPool = this.tempPool.slice();
+		const savedTempInUse = new Set(this.tempInUse);
+		const saved_isTempReg = this.isTempReg; // not strictly needed
+
+		// fresh local state for function
+		this.varReg = new Map();
+		this.nextVarReg = 0; // local r0..r7 for function locals/params
+		this.nextTempReg = 8; // r8..r15 for temps inside function
+		this.tempPool = [];
+		this.tempInUse = new Set();
+
+		// label for function entry
+		this.emit(`${label}:`);
+		// set current function marker
+		this._inFunction = fnName;
+
+		// move parameters from argRegs into local vars
+		const params = fnNode.params || [];
+		for (let i = 0; i < params.length; i++) {
+			const p = params[i];
+			if (p.type !== 'Identifier')
+				throw new Error('Only simple identifier params supported');
+			const dest = this.allocVar(p.name); // will allocate r0..r7 or stack
+			const argReg = this.argRegs[i];
+			if (!argReg)
+				throw new Error(`Function ${fnName} supports up to ${this.argRegs.length} args`);
+			// argReg may be immediate/register/symbol; just move
+			this.emit(`move ${dest} ${argReg}`);
+		}
+
+		// compile function body statements
+		if (fnNode.body && fnNode.body.type === 'BlockStatement') {
+			// walk through statements; ReturnStatement handled in compileStatement
+			for (const s of fnNode.body.body) {
+				this.compileStatement(s);
+			}
+		} else {
+			throw new Error('Unsupported function body format');
+		}
+
+		// fallthrough: ensure function returns (default 0)
+		this.emit(`move r1 0`);
+		this.emit(`j ra`);
+
+		// restore caller state
+		this.varReg = savedVarReg;
+		this.nextVarReg = savedNextVarReg;
+		this.nextTempReg = savedNextTempReg;
+		this.tempPool = savedTempPool;
+		this.tempInUse = savedTempInUse;
+		this._inFunction = null;
+	}
+
 	// ---------------- helpers / conversion ----------------
 	convertJsValueToNumber(value, nodeHint) {
 		if (value === null)
@@ -1619,7 +1766,7 @@ class IC10Compiler {
 		}
 
 		// Second pass: replace label operands in jump-like instructions with numeric indices
-		const jumpOpNames = new Set(['j', 'beq', 'bne', 'blt', 'bgt', 'ble', 'bge']);
+		const jumpOpNames = new Set(['j', 'jal', 'beq', 'bne', 'blt', 'bgt', 'ble', 'bge']);
 		const replaced = outLines.map((ln) => {
 				// split tokens to inspect last token (jump target is usually the last token)
 				const parts = ln.split(/\s+/).filter(Boolean);
@@ -1706,7 +1853,7 @@ class IC10Compiler {
 			return;
 
 		// find referenced labels from jump-like ops
-		const jumpOpNames = new Set(['j', 'beq', 'bne', 'blt', 'bgt', 'ble', 'bge']);
+		const jumpOpNames = new Set(['j', 'jal', 'beq', 'bne', 'blt', 'bgt', 'ble', 'bge']);
 		const referenced = new Set();
 		for (const ln of this.code) {
 			const tl = (ln || '').trim();

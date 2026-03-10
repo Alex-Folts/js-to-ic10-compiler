@@ -164,7 +164,7 @@ while (a < 5) {
 
   <footer>
     <div class="small"></div>
-    <div class="small">Version: 0.2.0</div>
+    <div class="small">Version: 0.3.0</div>
   </footer>
 </div>
 
@@ -252,7 +252,7 @@ while (a < 5) {
 	// ---------------------- output CodeMirror + simple ic10 mode ----------------------
 	// 1) Define a very small mode for IC10 assembly-like highlighting
 	CodeMirror.defineMode("ic10", function () {
-		const keywords = /^(move|add|sub|mul|div|mod|seq|sne|slt|sle|sgt|sge|l|s|j|beq|bne|blt|bgt|ble|bge|select|peek|poke|push|pop|define|select|max|min|atan2|abs|acos|asin|atan|cos|sin|tan|ceil|exp|floor|log|rand|round|sqrt|trunc|sleep|yield|hcf)\b/i;
+		const keywords = /^(move|add|sub|mul|div|mod|seq|sne|slt|sle|sgt|sge|l|s|j|jal|beq|bne|blt|bgt|ble|bge|select|peek|poke|push|pop|define|select|max|min|atan2|abs|acos|asin|atan|cos|sin|tan|ceil|exp|floor|log|rand|round|sqrt|trunc|sleep|yield|hcf)\b/i;
 		return {
 			token: function (stream) {
 				if (stream.eatSpace())
