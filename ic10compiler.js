@@ -108,7 +108,7 @@ class IC10Compiler {
 		if (!this.tempInUse.has(reg))
 			return;
 
-		//console.log('--- Freeing: ' + reg + ' at line: [' + this.code[this.code.length - 1] + ']');
+		//console.log('--- Freeing: ' + reg + ' at line(' + (this.code.length - 1) + '): [' + this.code[this.code.length - 1] + ']');
 		if (!this.debug) {
 			// Attempt on-the-fly optimization: if the last emitted lines are
 			// "<op> reg ..." followed by "move dest reg", we can rewrite op to write to dest directly
@@ -288,6 +288,7 @@ class IC10Compiler {
 		if (this.functions.size > 0) {
 			this.emit(`j bypass_hack`); //we jump after last line to prevent program execute body of functions which will be placed at the tail of the program
 
+			this._inFunction = null; // reset name of the function currently compiling
 			// compile hoisted functions (in insertion order)
 			for (const[fnName, fnNode]of this.functions.entries()) {
 				const label = this._functionLabels.get(fnName);
@@ -1112,11 +1113,23 @@ class IC10Compiler {
 
 					// --- caller-save: figure which r0..r7 are currently used for variables ---
 					const usedRegs = []; // array of register numbers (integers) in ascending order
+					//gather used var-regs
 					for (const[, reg]of this.varReg.entries()) {
 						const m = /^r(\d+)$/.exec(reg);
 						if (m) {
 							const rn = Number(m[1]);
 							if (rn >= 0 && rn <= 7) {
+								if (!usedRegs.includes(rn))
+									usedRegs.push(rn);
+							}
+						}
+					}
+					//gather used temp-regs
+					for (const[, reg]of this.tempInUse.entries()) {
+						const m = /^r(\d+)$/.exec(reg);
+						if (m) {
+							const rn = Number(m[1]);
+							if (rn >= 8 && rn <= 15) {
 								if (!usedRegs.includes(rn))
 									usedRegs.push(rn);
 							}
@@ -1141,13 +1154,20 @@ class IC10Compiler {
 
 					// If any regs used, allocate a temp to stage moves then push them.
 					let saver = null;
+					const needSaveRA = !!this._inFunction; // true when compiling inside function body
 					if (usedRegs.length > 0) {
 						saver = this.newTemp(); // uses r8..r15
 						for (const rn of usedRegs) {
 							this.emit(`move ${saver} r${rn}`);
 							this.emit(`push ${saver}`);
 						}
-						// we keep saver reserved until restore
+						// push ra AFTER registers (so ra is popped first)
+						if (needSaveRA) {
+							this.emit(`move ${saver} ra`);
+							this.emit(`push ${saver}`);
+						}
+						// we release saver cause of potential nested calls/recursion happens inside the function, which will keep consume temp registers for new savers
+						this.freeTemp(saver);
 					}
 
 					// --- call ---
@@ -1160,6 +1180,12 @@ class IC10Compiler {
 
 					// --- restore saved registers (pop in reverse order) ---
 					if (usedRegs.length > 0) {
+						saver = this.newTemp(); // uses r8..r15
+						// if we saved ra we pushed it last -> pop it first (restore ra)
+						if (needSaveRA) {
+							this.emit(`pop ${saver}`);
+							this.emit(`move ra ${saver}`);
+						}
 						// pop values into saver then move into registers (reverse order of pushes)
 						for (let i = usedRegs.length - 1; i >= 0; i--) {
 							const rn = usedRegs[i];
@@ -1512,6 +1538,8 @@ class IC10Compiler {
 
 		// label for function entry
 		this.emit(`${label}:`);
+		// mark we're in a function (so nested calls will save/restore ra)
+		const prevInFunction = this._inFunction || null;
 		// set current function marker
 		this._inFunction = fnName;
 
@@ -1549,7 +1577,8 @@ class IC10Compiler {
 		this.nextTempReg = savedNextTempReg;
 		this.tempPool = savedTempPool;
 		this.tempInUse = savedTempInUse;
-		this._inFunction = null;
+		//restore
+		this._inFunction = prevInFunction;
 	}
 
 	// ---------------- helpers / conversion ----------------
