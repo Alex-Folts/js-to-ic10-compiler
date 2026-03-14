@@ -164,7 +164,7 @@ while (a < 5) {
 
   <footer>
     <div class="small"></div>
-    <div class="small">Version: 0.3.2</div>
+    <div class="small">Version: 0.3.3</div>
   </footer>
 </div>
 
@@ -517,7 +517,7 @@ while (a < 5) {
   /* Info panel styles */
   .info-panel {
     position: fixed;
-    top: 80px;
+    top: 160px;
     left: 80px;
     width: 856px;
     height: 624px;
@@ -614,6 +614,11 @@ while (a < 5) {
     .info-panel { width: 92vw; left:4vw; top:40px; height:70vh; }
     .info-panel .left { display:none; }
   }
+  
+  code {
+    font-family: monospace;
+    color: darkviolet;
+  }
 </style>
 
 <div id="infoPanel" class="info-panel" role="dialog" aria-hidden="true">
@@ -645,12 +650,19 @@ while (a < 5) {
       <div id="infoDoc" class="doc" aria-live="polite">
         <!-- ---------- built-in HTML docs here ---------- -->
         <h3 id="intro">Introduction</h3>
-        <p>This page describes the JS → IC10 compiler features available in this UI.</p>
+        <p>This page describes the JS → IC10 compiler features available.</p>
 
         <h4 id="implemented">Currently implemented JS features</h4>
         <ul>
           <li><code>var</code>, <code>let</code>, <code>const</code> supports only numbers; <code>true</code> and <code>false</code> get converted to 1 and 0 respectively; string values attempts to parse to a number.</li>
+		  <li>Comparison operators: <code><</code>, <code>></code>, <code>==</code>, <code>!=</code>, <code>===</code>, <code>!==</code>, <code>>=</code>, <code><=</code>.</li>
+		  <li>Arithmetic operators: <code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>%</code>.</li>
+		  <li>Logical operators: <code>&&</code>, <code>||</code>.</li>
+		  <li>Compound operators: <code>+=</code>, <code>-=</code>, <code>*=</code>, <code>/=</code>.</li>
+		  <li>Unary operators: <code>-</code>, <code>!</code>.</li>
+		  <li>Conditional (ternary) operator: <code><i>condition</i> ? <i>exprIfTrue</i> : <i>exprIfFalse</i></code>.</li>
           <li>Implemented flow control: <code>while</code>, <code>for</code> loops, <code>switch-case</code> statement, <code>if-else</code> statement, <code>break</code>, <code>continue</code> .</li>
+		  <li>User-defined functions, nested calls and <i>limited</i> recursion.</li>
         </ul>
 
         <h4 id="ic10lib">IC10 virtual library</h4>
@@ -667,8 +679,11 @@ while (a < 5) {
         <p>Common <code>Math.*</code> functions are translated to IC10 ops. Not all functions are exact; some are emulated (e.g. <code>cbrt</code> via Newton iterations).</p>
         <p><code>acos</code>, <code>asin</code>, <code>atan</code> functions behave differently: in IC10 for parameter values <1> it returns 0, while in JS it return NaN.</p>
 
-        <h4 id="limits">Limits & lines</h4>
+        <h4 id="limits">Limits, lines, stack</h4>
         <p>IC10 programs are limited to <strong>128 lines</strong> by the game. The UI shows a line counter. In compact mode the compiler uses numeric jump targets to reduce line overhead.</p>
+		<p>Stack has total of <strong>512 values</strong>, compiler uses stack for defining global variables, and stashing registers when do user-defined function calls.</p>
+		<p>User-defined functions limited to maximum of <strong>4 arguments</strong>.</p>
+		<p>No scopes, scope blocks <code>{...}</code> parses properly, but all variables/consts/functions implemented as a globals.</p>
 
         <h4 id="links">Links</h4>
         <ul>

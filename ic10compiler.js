@@ -1202,26 +1202,86 @@ class IC10Compiler {
 			}
 
 		case 'ConditionalExpression': {
-				const cond = this.compileExpressionToReg(node.test);
-				const cons = this.compileExpressionToReg(node.consequent);
-				const alt = this.compileExpressionToReg(node.alternate);
+				// If both branches are pure (no calls / assignments / updates), keep the fast select.
+				const needsBranch = this._exprHasSideEffects(node.consequent) || this._exprHasSideEffects(node.alternate);
 
-				let dest = null;
-				if (this.isTempReg(cons))
-					dest = cons;
-				else if (this.isTempReg(alt))
-					dest = alt;
-				else
-					dest = this.newTemp();
+				if (!needsBranch) {
+					// old fast path: evaluate both and use select
+					const cond = this.compileExpressionToReg(node.test);
+					const cons = this.compileExpressionToReg(node.consequent);
+					const alt = this.compileExpressionToReg(node.alternate);
 
-				this.emit(`select ${dest} ${cond} ${cons} ${alt}`);
+					let dest = null;
+					if (this.isTempReg(cons))
+						dest = cons;
+					else if (this.isTempReg(alt))
+						dest = alt;
+					else
+						dest = this.newTemp();
 
-				if (cond !== dest && this.isTempReg(cond))
-					this.freeTemp(cond);
-				if (cons !== dest && this.isTempReg(cons))
-					this.freeTemp(cons);
-				if (alt !== dest && this.isTempReg(alt))
-					this.freeTemp(alt);
+					this.emit(`select ${dest} ${cond} ${cons} ${alt}`);
+
+					if (cond !== dest && this.isTempReg(cond))
+						this.freeTemp(cond);
+					if (cons !== dest && this.isTempReg(cons))
+						this.freeTemp(cons);
+					if (alt !== dest && this.isTempReg(alt))
+						this.freeTemp(alt);
+
+					return dest;
+				}
+
+				// Branching path: only evaluate the chosen branch (safe for calls/recursion).
+				const condRegOrVal = this.compileExpressionToReg(node.test);
+
+				// ensure we have a register we can test with BEQ; if cond is a literal or symbol, move to temp
+				let condReg = condRegOrVal;
+				let condTmpAllocated = false;
+				if (typeof condRegOrVal === 'number' || (typeof condRegOrVal === 'string' && !/^r\d+$/.test(condRegOrVal))) {
+					condReg = this.newTemp();
+					this.emit(`move ${condReg} ${condRegOrVal}`);
+					condTmpAllocated = true;
+				}
+
+				const elseLabel = this.newLabel('tern_else');
+				const endLabel = this.newLabel('tern_end');
+
+				// if condition == 0 -> else
+				this.emit(`beq ${condReg} 0 ${elseLabel}`);
+
+				// allocate destination temp (we'll always produce a temp result)
+				const dest = this.newTemp();
+
+				// CONSEQUENT
+				const consVal = this.compileExpressionToReg(node.consequent);
+				if (this.isTempReg(consVal)) {
+					// move into dest (consVal is temporary)
+					this.emit(`move ${dest} ${consVal}`);
+					this.freeTemp(consVal);
+				} else {
+					// literal or named symbol -> copy into dest
+					this.emit(`move ${dest} ${consVal}`);
+				}
+
+				// jump over alternate
+				this.emit(`j ${endLabel}`);
+
+				// ELSE:
+				this.emit(`${elseLabel}:`);
+				const altVal = this.compileExpressionToReg(node.alternate);
+				if (this.isTempReg(altVal)) {
+					this.emit(`move ${dest} ${altVal}`);
+					this.freeTemp(altVal);
+				} else {
+					this.emit(`move ${dest} ${altVal}`);
+				}
+
+				// END:
+				this.emit(`${endLabel}:`);
+
+				// cleanup condition temp if we allocated one
+				if (condTmpAllocated && this.isTempReg(condReg))
+					this.freeTemp(condReg);
 
 				return dest;
 			}
@@ -1807,6 +1867,39 @@ class IC10Compiler {
 			pin,
 			prop
 		};
+	}
+
+	// return true if the expression may have side-effects or do calls (so it must not be speculatively evaluated)
+	_exprHasSideEffects(node) {
+		if (!node || typeof node !== 'object')
+			return false;
+		switch (node.type) {
+		case 'CallExpression':
+		case 'AssignmentExpression':
+		case 'UpdateExpression':
+			return true;
+		case 'LogicalExpression':
+			return this._exprHasSideEffects(node.left) || this._exprHasSideEffects(node.right);
+		case 'BinaryExpression':
+		case 'UnaryExpression':
+		case 'ConditionalExpression':
+			// check subexpressions
+			for (const k of['left', 'right', 'argument', 'test', 'consequent', 'alternate']) {
+				if (node[k] && this._exprHasSideEffects(node[k]))
+					return true;
+			}
+			return false;
+		case 'MemberExpression':
+			// member reads may be pure (reads) — conservative: treat only calls as side-effecting
+			// if you prefer to treat certain device reads as side-effecting, return true here
+			return this._exprHasSideEffects(node.object) || this._exprHasSideEffects(node.property);
+		case 'Identifier':
+		case 'Literal':
+			return false;
+		default:
+			// be conservative for unknown/complex nodes
+			return true;
+		}
 	}
 
 	// ---------------- compact-mode finalizer ----------------
