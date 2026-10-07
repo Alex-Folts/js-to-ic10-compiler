@@ -114,31 +114,22 @@
       </div>
 
       <div class="editorHolder editorWrap">
-        <textarea id="src">
-// Example: math + device read/write
-var a = 2;
-var b = 10;
-var sum = a + b * 3;
-
-// read temperature from device on d0
-var temp = IC10.d0.Temperature;
-
-IC10.yield();
-
-// set the On property of device d1 based on condition
-if (sum > temp) {
-  IC10.d1.On = 1;
-} else {
-  IC10.d1.On = 0;
+<textarea id="src">
+const PRESSURE_TRESHOLD_ON = 90;//kPa
+const PRESSURE_TRESHOLD_OFF = 30;//kPa
+//For controlling filtration unit
+while (true) {
+  var pressure = IC10.d0.PressureInput;//d0 - filtration unit
+  IC10.db.Setting = pressure;//debug stuff
+  if (pressure > PRESSURE_TRESHOLD_ON) {
+    IC10.d0.On = 1;
+  }
+  if (pressure < PRESSURE_TRESHOLD_OFF) {
+    IC10.d0.On = 0;
+  }
+  IC10.sleep(5);//seconds
 }
-
-IC10.sleep(1);
-
-// simple loop: increment a until 5
-while (a < 5) {
-  a = a + 1;
-}
-        </textarea>
+</textarea>
       </div>
     </section>
 
