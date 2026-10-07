@@ -276,7 +276,7 @@ while (a < 5) {
 				if (stream.match(/^#.*$/)) {
 					stream.skipToEnd();
 					return "comment";
-				} // comments (if you use #)
+				} // comments (#)
 				// anything else: advance one char
 				stream.next();
 				return null;
@@ -481,14 +481,11 @@ while (a < 5) {
 		const payloadObj = {
 			"program": "",
 			"registers": {
-				"io": [{}, {}, {}, {}, {}, {}, {}
-				],
+				"io": [{}, {}, {}, {}, {}, {}, {}],
 				"ioConnected": [true, true, true, true, true, true, true],
 				"internal": Array(18).fill(0),
-				"ioSlot": [{}, {}, {}, {}, {}, {}, {}
-				],
-				"ioReagent": [{}, {}, {}, {}, {}, {}, {}
-				]
+				"ioSlot": [{}, {}, {}, {}, {}, {}, {}],
+				"ioReagent": [{}, {}, {}, {}, {}, {}, {}]
 			},
 			"runAfterRegisterChange": false,
 			"runWithErrors": false
